@@ -4,9 +4,22 @@ One-way media sync between drives that carry their own index, with offline
 lookup and a full-screen progress view. Built for Tower → Tower Backup, and for
 pulling a selection off both onto an SSD at the speed of two drives.
 
+## Build and install
+
+Requires macOS and a Rust toolchain supporting edition 2024.
+
 ```sh
-scripts/install/install-safesync.sh     # → ~/.local/bin/safesync
+git clone https://github.com/monomadic/safesync.git
+cd safesync
+cargo build --release --locked
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/safesync "$HOME/.local/bin/safesync"
 ```
+
+The [dotfiles installer](https://github.com/monomadic/config/blob/master/scripts/install/install-safesync.sh)
+clones or updates this repository at `$SRC_PATH/safesync` (default
+`~/src/safesync`) and installs to `~/.local/bin`. Run
+`scripts/install/install-safesync.sh` from the dotfiles checkout to use it.
 
 ## The drives screen
 
@@ -189,7 +202,7 @@ Exit 0 done, 1 cancelled or some files failed, 2 refused or errored.
 ## Tests
 
 ```sh
-cargo test --manifest-path src/safesync/Cargo.toml
+cargo test --locked
 ```
 
 `tests/sync.rs` creates APFS ram disks with `hdiutil`/`diskutil` so sentinel
