@@ -687,6 +687,9 @@ fn run_fill(options: FillOptions, control: &Control) -> Result<()> {
     );
     // The source is the authority when the drives disagree about a path.
     drives.sort_by_key(|drive| drive.sentinel.role != Role::Source);
+    // Decide from the nearest existing ancestor before creating anything: a
+    // source or backup must not gain even an empty directory.
+    drive::check_fill_destination(&options.destination)?;
     fs::create_dir_all(&options.destination)?;
     drive::check_fill_destination(&options.destination)?;
     let destination = options.destination.canonicalize()?;

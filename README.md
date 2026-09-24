@@ -241,4 +241,4 @@ cargo test --locked
 ```
 
 `tests/sync.rs` creates APFS ram disks with `hdiutil`/`diskutil` so sentinel
-UUIDs, preallocation and exclusive renames are the real thing (~25 s).
+UUIDs, preallocation and exclusive renames are the real thing (about a minute).

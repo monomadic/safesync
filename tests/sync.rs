@@ -176,7 +176,11 @@ fn sentinel_pins_role_and_volume() {
     assert!(drive::check_fill_destination(&b.root).is_err());
     let d = RamDisk::new("d");
     Drive::init(&d.root, Role::Scratch, None).unwrap();
-    drive::check_fill_destination(&d.root.join("new")).unwrap_err(); // does not exist yet
+    // A destination that does not exist yet is judged by its nearest existing
+    // ancestor, so nothing has to be created before the role is known.
+    drive::check_fill_destination(&d.root.join("new/deeper")).unwrap();
+    drive::check_fill_destination(&a.root.join("new/deeper")).unwrap_err();
+    assert!(!a.root.join("new").exists());
     fs::create_dir_all(d.root.join("new")).unwrap();
     drive::check_fill_destination(&d.root.join("new")).unwrap();
 }
@@ -1074,4 +1078,30 @@ fn sync_hashes_only_unmatched_backup_candidates_and_reuses_the_rename_next_time(
         b"same content"
     );
     fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn fill_refuses_a_source_destination_before_creating_anything() {
+    let _guard = HOME.lock().unwrap_or_else(|p| p.into_inner());
+    let home = home();
+    unsafe { std::env::set_var("HOME", &home) };
+    let a = RamDisk::new("lib");
+    Drive::init(&a.root, Role::Source, None).unwrap();
+    write(&a.root, "clip.mov", b"media");
+    scan(&a.root);
+    let destination = a.root.join("new/dump");
+    let options = FillOptions {
+        from: vec![a.root.clone()],
+        destination: destination.clone(),
+        select: vec![],
+        verify: false,
+    };
+    let filled = drive_work(move |ctl| engine::fill(options, ctl), true);
+    assert!(
+        filled.failure().is_some_and(|m| m.contains("fill only writes to scratch disks")),
+        "{:?}",
+        filled.failure()
+    );
+    assert!(!a.root.join("new").exists(), "a source gained a directory");
+    let _ = fs::remove_dir_all(&home);
 }

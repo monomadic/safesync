@@ -369,11 +369,18 @@ pub fn check_sync(source: &Drive, backup: &Drive) -> Result<()> {
 }
 
 /// `fill` may write anywhere except onto a source or a backup. The nearest
-/// sentinel at or above the destination, on the same volume, decides.
+/// sentinel at or above the destination, on the same volume, decides. The
+/// destination need not exist yet: the check starts from its nearest existing
+/// ancestor, so nothing is created on a drive before its role is known.
 pub fn check_fill_destination(destination: &Path) -> Result<()> {
-    let destination = destination
+    let absolute = std::env::current_dir()?.join(destination);
+    let existing = absolute
+        .ancestors()
+        .find(|p| p.exists())
+        .context("Destination has no existing ancestor")?;
+    let destination = existing
         .canonicalize()
-        .context("Destination does not exist")?;
+        .context("Cannot resolve destination")?;
     let device = fs::metadata(&destination)?.dev();
     for ancestor in destination.ancestors() {
         if fs::metadata(ancestor)?.dev() != device {

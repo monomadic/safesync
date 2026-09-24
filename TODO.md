@@ -4,6 +4,20 @@ Scope: source indexing, offline lookup, sentinel-guarded one-way sync, parallel 
 TUI. Not a journaled transaction engine — see git history before 2026-09-23
 for the version that tried to be.
 
+## Before the first real run
+
+Everything below is judged against one milestone: a real Tower → Tower Backup
+sync whose plan matches `rclone-tower-safe --dry-run`. Only these block it;
+setup flow, volume rows and offline records are UX and can follow a few good syncs.
+
+- [ ] Stop after the first ENOSPC and show space in the preview (the space
+      handling item below).
+- [x] `fill` created its destination directory before checking the sentinel,
+      so `--to /Volumes/Tower/new` wrote a directory onto a source. The check
+      now runs from the nearest existing ancestor, before anything is created.
+- [ ] Do the run. Without a TTY and without `--yes`, `sync` prints the plan and
+      declines, which is the dry run to diff against rclone's.
+
 ## Index the source, walk the backup
 
 Agreed model: **index the source; check the backup**. A source carries its own
@@ -75,7 +89,15 @@ until the explicit migration below.
       requiring manual indexing first.
 - [ ] First real run: works on today's engine. Set up Tower as source and Tower
       Backup as its backup, **Check / sync**, compare the plan with
-      `rclone-tower-safe --dry-run` before confirming.
+      `rclone-tower-safe --dry-run` before confirming. See "Before the first
+      real run" above for what has to land first.
+- [ ] Scan recheck pass: after the walk, `scan.rs` reopens and stats every file
+      again and aborts on any change anywhere. On Tower that is a second
+      1.5 M-file metadata pass over USB, and one Spotlight or Finder touch fails
+      the whole sync closed. `copy_file` already rechecks each file's stamp
+      immediately before reading it, so decide: recheck directories only
+      (their mtime moves on any add, remove or rename underneath) and drop the
+      per-file pass, or keep it and accept the cost. Note the decision here.
 
 ## Other work
 
@@ -103,6 +125,11 @@ until the explicit migration below.
       have no index and a local catalog copy is not a second copy. A live copy
       report checks mounted readers directly.
 - [ ] Disk-image power-loss test of index publication (fsync + hard-link ordering).
+- [ ] Small consistency fixes: `fill` compares an existing destination file's
+      mtime in seconds while `sync` compares nanoseconds; `paths` aborts
+      entirely if any mounted source has a copied or damaged sentinel instead
+      of skipping it; `check_sync` should also refuse a backup whose volume UUID
+      equals the source's, in case a sentinel was edited by hand.
 
 ## Binary index
 
@@ -208,19 +235,33 @@ appears that needs an ad-hoc query.
       source search and sync decisions. Retire those catalogs through an explicit
       migration step, retaining their offline volume metadata as described above,
       without touching sentinels, media or history. Temporary manifests
-      may remain an engine implementation detail; tests must cover source-only
-      publication and destinations with no saved index, separately from codec tests.
-      Cover backups with different exclusions without shrinking the source catalog;
-      source-excluded backup files staying untouched even with `extras = history`;
-      preflight refusal of an oversized plan, stopping after the first ENOSPC
-      mid-run, and a rerun completing the remainder (rename ambiguity and
-      replacement rollback are already covered);
-      offline backup rows surviving legacy-index retirement and generation pruning;
-      same-name volumes being distinguished by UUID; fill with only the source
-      mounted, and with a backup reader that lacks any index. Codec/export tests cover truncated
-      trailers, header/string-heap corruption, invalid region bounds,
-      raw tab/newline/non-UTF-8 paths, changed mount
-      points, offline roots and exactly one NUL after each exported full path.
+      may remain an engine implementation detail. Codec/export tests already
+      cover truncated trailers, header/string-heap corruption, invalid region
+      bounds, raw tab/newline/non-UTF-8 paths, changed mount points, offline
+      roots and exactly one NUL after each exported full path.
+- [ ] **Behavioural coverage still owed** (rename ambiguity and replacement
+      rollback are already covered):
+  - [ ] source-only publication and destinations with no saved index,
+        separately from codec tests
+  - [ ] backups with different exclusions without shrinking the source catalog
+  - [ ] source-excluded backup files staying untouched even with `extras = history`
+  - [ ] preflight refusal of an oversized plan
+  - [ ] stopping after the first ENOSPC mid-run, and a rerun completing the remainder
+  - [ ] offline backup rows surviving legacy-index retirement and generation pruning
+  - [ ] same-name volumes being distinguished by UUID
+  - [ ] fill with only the source mounted, and with a backup reader that lacks any index
+- [ ] **Sync still pays the full parse.** The format now serves `paths`,
+      `lookup` and the drives screen, but the sync path does not use it:
+      `Drive::hash_cache` calls `Manifest::load` on every kept generation on
+      the drive and in the library, and for a binary file that is `to_manifest`,
+      which materialises every entry with a base64 path and a hex fingerprint
+      (`hex` in `filesystem.rs` formats one byte at a time). For Tower that is up
+      to six full conversions of 1.5 M entries before the walk begins. The
+      record table already holds file ID, size, mtime and fingerprint, so build
+      the cache from mapped records without creating entries, and give `hex` a
+      lookup table. Then take the merge-join idea above seriously: plan from
+      the mapped source table against a sorted transient backup walk, so the
+      planner stops decoding base64 for every path comparison.
 - [x] **Library pruning** — keeps the newest 3 generations per volume UUID across both formats
       (`KEPT_GENERATIONS` in `drive.rs`). Once backups stop publishing, their old
       copies in `~/Library/Application Support/safesync/manifests/` are retired by

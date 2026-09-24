@@ -23,7 +23,7 @@ except for its own index. The index (`.safesync/index-GENERATION.jsonl`) on
 the drive is the source of truth; the copy in `~/Library/Application
 Support/safesync/manifests/` is for `lookup` while the drive is unplugged.
 Fingerprints are reused by file ID + size + mtime, so a rescan reads only new
-files. Tests build real APFS ram disks (`tests/sync.rs`, ~25 s). It is meant
+files. Tests build real APFS ram disks (`tests/sync.rs`, about a minute). It is meant
 to replace `rclone-tower-safe`; until it has, the two coexist and neither
 knows about the other's history directory. Don't add a journal, lease or
 relationship layer back — that version was cut on purpose (git history before
