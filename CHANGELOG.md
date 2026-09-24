@@ -6,6 +6,11 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ### Fixed
 
+- Sync now previews required and available space before refusing an oversized
+  plan, and checks again at confirmation. A disk-full error stops subsequent
+  actions after cleanup/rollback, reports an incomplete run, and preserves
+  completed copies and history for a later retry.
+
 - `fill` created its destination directory before checking the drive's
   sentinel, so a destination under a source or backup gained an empty
   directory before being refused. The role is now decided from the nearest

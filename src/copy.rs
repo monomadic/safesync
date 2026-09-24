@@ -5,7 +5,7 @@ use crate::{
     filesystem::{FilePath, Stamp, hex},
     manifest::Entry,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::CString,
@@ -71,10 +71,9 @@ fn preallocate(file: &File, size: u64) -> Result<()> {
     }
     let error = std::io::Error::last_os_error();
     // A filesystem that cannot preallocate is not a problem; a full one is.
-    ensure!(
-        result != -1 || error.raw_os_error() != Some(libc::ENOSPC),
-        "Not enough space on the destination"
-    );
+    if result == -1 && error.raw_os_error() == Some(libc::ENOSPC) {
+        return Err(error).context("Not enough space on the destination");
+    }
     Ok(())
 }
 
@@ -156,7 +155,7 @@ pub fn copy_file(
                     failure = Some(anyhow::anyhow!("Cancelled"));
                     break;
                 }
-                if let Err(error) = output.write_all(&buffer.bytes()[..filled]) {
+                if let Err(error) = write_buffer(&mut output, &buffer.bytes()[..filled]) {
                     failure = Some(error.into());
                     break;
                 }
@@ -198,11 +197,9 @@ pub fn copy_file(
                 libc::COPYFILE_ACL | libc::COPYFILE_STAT | libc::COPYFILE_XATTR,
             )
         };
-        ensure!(
-            copied == 0,
-            "Cannot copy metadata: {}",
-            std::io::Error::last_os_error()
-        );
+        if copied != 0 {
+            return Err(std::io::Error::last_os_error()).context("Cannot copy metadata");
+        }
         ensure!(
             Stamp::of(&source_fd.metadata()?) == before,
             "Source changed while metadata was copied"
@@ -252,4 +249,34 @@ pub fn space(path: &Path) -> Result<(u64, u64)> {
     let stat = unsafe { stat.assume_init() };
     let block = stat.f_bsize as u64;
     Ok((stat.f_bavail * block, stat.f_blocks * block))
+}
+
+/// Inspect the original errno, even when callers have added context.
+pub(crate) fn is_disk_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
+    })
+}
+
+// Deterministic write failures exercise cleanup after data has been written.
+// Thread-local and test-only: never affects another worker or a release build.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_WRITE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn write_buffer(output: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    FAIL_WRITE_AFTER.with(|remaining| {
+        if let Some(n) = remaining.get() {
+            remaining.set(n.checked_sub(1));
+            if n == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+        }
+        Ok(())
+    })?;
+    output.write_all(bytes)
 }

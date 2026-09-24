@@ -71,7 +71,8 @@ Icons have extra trailing space for wide glyphs. Icons are enabled by default:
   changes, read-only volume, missing backup, or insufficient space.
 - 􀩎 — an unassigned drive that can be given a role.
 
-Space is checked against the live sync plan. Renames need no copy space;
+The preview shows required and available space; confirmation checks free space
+again and refuses an oversized plan before transferring. Renames need no copy space;
 replacements need space for the new content because the old version is kept
 in history. `--no-icons` removes drive symbols; piped output is plain text.
 
@@ -179,6 +180,13 @@ the scan before moving. If a replacement fails, the previous file is restored. `
 after the copy. Esc stops after the current file. Newly learned fingerprints
 are published to the source index at the end. Backup observations stay in
 memory; the next check walks the backup again.
+
+If the destination fills during sync, the failed partial copy is removed and a
+failed replacement is restored from history. If restoration itself fails, the
+error identifies that the previous version remains in history. No further actions
+are started. Completed files stay, the run reports incomplete (exit 1), and a new
+run checks the drives again to plan the remainder. History is never pruned to make
+space automatically.
 
 ## fill
 

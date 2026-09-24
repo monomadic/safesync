@@ -10,7 +10,7 @@ Everything below is judged against one milestone: a real Tower → Tower Backup
 sync whose plan matches `rclone-tower-safe --dry-run`. Only these block it;
 setup flow, volume rows and offline records are UX and can follow a few good syncs.
 
-- [ ] Stop after the first ENOSPC and show space in the preview (the space
+- [x] Stop after the first ENOSPC and show space in the preview (the space
       handling item below).
 - [x] `fill` created its destination directory before checking the sentinel,
       so `--to /Volumes/Tower/new` wrote a directory onto a source. The check
@@ -44,18 +44,15 @@ until the explicit migration below.
       checks and the preview before copying. History pruning is manual only.
       The backup walk is the existing scanner without publish; nothing about
       the backup is written except media and history.
-- [ ] Space handling: most of it exists. Preflight refuses a plan larger than
-      free space (`engine.rs`, replacements at full size, renames and history
-      moves at zero); ENOSPC at preallocation fails cleanly and removes the
-      partial file; a failed replacement is restored from history. Two gaps:
-      the refusal happens before the preview, so show the required bytes and
-      free space in the preview and refuse at confirmation instead; and the
-      action loop keeps going after a failure, so on a full disk every
-      remaining copy fails in turn and every remaining replace moves its old
-      version to history, fails, and restores it. Distinguish ENOSPC from other
-      per-file failures and stop scheduling after the first. Completed files
-      stay, the run reports incomplete, and a rerun plans the remainder from a
-      fresh walk. Never prune history automatically to make room.
+- [x] Space handling: preview shows required and available bytes, including an
+      insufficient-space warning. Confirmation rechecks free space before any
+      transfer. Replacements count at full size; renames/history moves at zero.
+      The first ENOSPC stops further actions after partial cleanup and replacement
+      rollback. Completed files stay; the run reports incomplete and how many
+      actions were not attempted. A rerun plans the remainder from a fresh walk.
+      History is never pruned automatically. Tests cover real APFS preallocation
+      failure, space consumed during review, injected write failures after partial
+      data, copy/replacement recovery, and completion on a fresh plan.
 - [x] Rename candidates with no stamp match may be hashed live. Only the backup
       file is read (the source fingerprint is in its index), and only for files
       that match nothing by size+mtime, so it is normally zero files. Show
@@ -245,8 +242,8 @@ appears that needs an ad-hoc query.
         separately from codec tests
   - [ ] backups with different exclusions without shrinking the source catalog
   - [ ] source-excluded backup files staying untouched even with `extras = history`
-  - [ ] preflight refusal of an oversized plan
-  - [ ] stopping after the first ENOSPC mid-run, and a rerun completing the remainder
+  - [x] preflight refusal of an oversized plan
+  - [x] stopping after the first ENOSPC mid-run, and a rerun completing the remainder
   - [ ] offline backup rows surviving legacy-index retirement and generation pruning
   - [ ] same-name volumes being distinguished by UUID
   - [ ] fill with only the source mounted, and with a backup reader that lacks any index

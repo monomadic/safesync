@@ -696,6 +696,8 @@ fn draw_done(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
     } else if let Some(summary) = &model.summary {
         let headline = if summary.cancelled {
             ("Cancelled", WARN)
+        } else if summary.disk_full {
+            ("Incomplete — destination full", ERR)
         } else if summary.failed > 0 {
             ("Finished with errors", ERR)
         } else if summary.done == 0 && model.verb != "scan" {
@@ -953,13 +955,18 @@ fn run_plain(model: &mut Model, events: Receiver<Event>, confirm: Sender<bool>, 
                 error: Some(error), ..
             } => eprintln!("  FAILED: {error}"),
             Event::Failed(error) => eprintln!("safesync: {error}"),
+            Event::Log(message) => eprintln!("  {message}"),
             Event::Done(summary) => eprintln!(
                 "{} files, {} in {}{}",
                 summary.done,
                 human(summary.bytes),
                 duration(summary.seconds),
-                if summary.cancelled {
+                if summary.disk_full {
+                    " (incomplete: destination full)"
+                } else if summary.cancelled {
                     " (cancelled)"
+                } else if summary.failed > 0 {
+                    " (incomplete: files failed)"
                 } else {
                     ""
                 }

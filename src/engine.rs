@@ -58,6 +58,8 @@ pub struct Summary {
     pub bytes: u64,
     pub seconds: f64,
     pub cancelled: bool,
+    pub disk_full: bool,
+    pub remaining: usize,
 }
 
 pub enum Event {
@@ -339,6 +341,16 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
         ));
     }
     let transfer_bytes = plan.transfer_bytes();
+    notes.push(format!(
+        "{} required; {} available on {}",
+        human(transfer_bytes),
+        human(free),
+        backup.sentinel.name
+    ));
+    if transfer_bytes > free {
+        notes
+            .push("Insufficient space: this sync cannot start. History will not be pruned.".into());
+    }
     let overview = Overview {
         items: plan
             .actions
@@ -365,13 +377,6 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
         transfer_bytes,
         notes,
     };
-    ensure!(
-        transfer_bytes <= free,
-        "{:?} has {} free but this sync needs {}",
-        backup.sentinel.name,
-        human(free),
-        human(transfer_bytes)
-    );
 
     let mut source_index = Index::new(source_manifest)?;
     let mut backup_index = Index::new(backup_manifest)?;
@@ -384,28 +389,21 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
         control.send(Event::Done(summary));
         return Ok(());
     } else {
+        // Review can remain open while other processes consume destination space.
+        let (free, _) = copy::space(&backup.root)?;
+        ensure!(
+            transfer_bytes <= free,
+            "Insufficient space: {:?} has {} free but this sync needs {}. Nothing transferred; history was not pruned.",
+            backup.sentinel.name,
+            human(free),
+            human(transfer_bytes)
+        );
         control.send(Event::Phase(Phase::Transfer));
         let history = PathBuf::from(drive::METADATA_DIR)
             .join("history")
             .join(&source_index.manifest.header.generation);
-        for action in &plan.actions {
-            if control.cancelled() {
-                summary.cancelled = true;
-                break;
-            }
-            let item_kind = match action {
-                Action::Copy { .. } => Kind::Copy,
-                Action::Replace { .. } => Kind::Replace,
-                Action::Rename { .. } => Kind::Rename,
-                Action::Retire { .. } => Kind::Retire,
-            };
-            control.send(Event::Start {
-                worker: 0,
-                kind: item_kind,
-                path: display(action.path()),
-                size: action.transfer(),
-            });
-            let result = apply(
+        run_actions(&plan.actions, control, &mut summary, |action| {
+            apply(
                 action,
                 &source_root,
                 &backup_root,
@@ -414,19 +412,8 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
                 &mut backup_index,
                 options.verify,
                 control,
-            );
-            match &result {
-                Ok(()) => {
-                    summary.done += 1;
-                    summary.bytes += action.transfer();
-                }
-                Err(_) => summary.failed += 1,
-            }
-            control.send(Event::Finish {
-                worker: 0,
-                error: result.err().map(|e| format!("{e:#}")),
-            });
-        }
+            )
+        });
     }
 
     control.send(Event::Phase(Phase::Indexing));
@@ -436,6 +423,53 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
     summary.seconds = started.elapsed().as_secs_f64();
     control.send(Event::Done(summary));
     Ok(())
+}
+
+fn run_actions(
+    actions: &[Action],
+    control: &Control,
+    summary: &mut Summary,
+    mut apply_action: impl FnMut(&Action) -> Result<()>,
+) {
+    for (index, action) in actions.iter().enumerate() {
+        if control.cancelled() {
+            summary.cancelled = true;
+            summary.remaining = actions.len() - index;
+            break;
+        }
+        let kind = match action {
+            Action::Copy { .. } => Kind::Copy,
+            Action::Replace { .. } => Kind::Replace,
+            Action::Rename { .. } => Kind::Rename,
+            Action::Retire { .. } => Kind::Retire,
+        };
+        control.send(Event::Start {
+            worker: 0,
+            kind,
+            path: display(action.path()),
+            size: action.transfer(),
+        });
+        let result = apply_action(action);
+        let disk_full = result.as_ref().err().is_some_and(copy::is_disk_full);
+        match &result {
+            Ok(()) => {
+                summary.done += 1;
+                summary.bytes += action.transfer();
+            }
+            Err(_) => summary.failed += 1,
+        }
+        control.send(Event::Finish {
+            worker: 0,
+            error: result.err().map(|e| format!("{e:#}")),
+        });
+        if disk_full {
+            summary.disk_full = true;
+            summary.remaining = actions.len() - index - 1;
+            control.send(Event::Log(format!(
+                "Stopped: destination is full. {} actions not attempted. Completed files are kept; free space and run sync again. History was not pruned.", summary.remaining)));
+            break;
+        }
+    }
 }
 
 fn fingerprint_rename_candidates(
@@ -622,9 +656,16 @@ fn apply(
                 Ok(copied) => copied,
                 Err(error) => {
                     if let Some((saved, mut entry)) = previous {
-                        saved
-                            .rename_to(&target)
-                            .context("and the previous version is still in history")?;
+                        if let Err(rollback) = saved.rename_to(&target) {
+                            if copy::is_disk_full(&rollback) {
+                                return Err(rollback).context(format!(
+                                    "Copy failed: {error:#}; could not restore the previous version, which remains in history"
+                                ));
+                            }
+                            return Err(error).context(format!(
+                                "Could not restore the previous version; it remains in history: {rollback:#}"
+                            ));
+                        }
                         let stamp = Stamp::of(&target.open()?.metadata()?);
                         if !unchanged_by_move(&entry.stamp, &stamp) {
                             entry.sha256 = None;
@@ -935,4 +976,186 @@ pub fn parse_selection(input: &[u8]) -> Vec<PathBuf> {
         .filter(|line| !line.is_empty())
         .map(|line| PathBuf::from(std::ffi::OsStr::from_bytes(line)))
         .collect()
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+    use crate::filesystem::Volume;
+    use std::sync::mpsc;
+
+    fn inventory(root: &Path) -> Index {
+        Index::new(
+            scan::scan(
+                root,
+                Volume {
+                    uuid: "space-test".into(),
+                    name: "Space test".into(),
+                    filesystem: "apfs".into(),
+                },
+                false,
+                |_| {},
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn full_disk_stops_copies_and_replacements_and_rerun_completes() {
+        for replace in [false, true] {
+            let temp = std::env::temp_dir().join(format!("safesync-space-{}", generation()));
+            let source_path = temp.join("source");
+            let backup_path = temp.join("backup");
+            fs::create_dir_all(&source_path).unwrap();
+            fs::create_dir_all(&backup_path).unwrap();
+            fs::write(source_path.join("first"), b"completed").unwrap();
+            fs::write(source_path.join("large"), vec![42; 16 << 20]).unwrap();
+            fs::write(source_path.join("last"), b"later").unwrap();
+            if replace {
+                fs::write(backup_path.join("large"), b"original").unwrap();
+            }
+            let source = Root::open(&source_path).unwrap();
+            let backup = Root::open(&backup_path).unwrap();
+            let mut source_index = inventory(&source_path);
+            let mut backup_index = inventory(&backup_path);
+            let history = Path::new(".safesync/history/test");
+            let actions = vec![
+                Action::Copy {
+                    path: "first".into(),
+                    size: 9,
+                },
+                if replace {
+                    Action::Replace {
+                        path: "large".into(),
+                        size: 16 << 20,
+                    }
+                } else {
+                    Action::Copy {
+                        path: "large".into(),
+                        size: 16 << 20,
+                    }
+                },
+                Action::Copy {
+                    path: "last".into(),
+                    size: 5,
+                },
+            ];
+            let (events, receiver) = mpsc::channel();
+            let (_confirm, replies) = mpsc::channel();
+            let control = Control {
+                events,
+                confirm: Mutex::new(replies),
+                cancel: Arc::new(AtomicBool::new(false)),
+            };
+            let mut summary = Summary::default();
+            run_actions(&actions, &control, &mut summary, |action| {
+                if action.path() == Path::new("large") {
+                    // One real buffer reaches disk, then the next write fails.
+                    copy::FAIL_WRITE_AFTER.with(|n| n.set(Some(1)));
+                }
+                apply(
+                    action,
+                    &source,
+                    &backup,
+                    history,
+                    &mut source_index,
+                    &mut backup_index,
+                    true,
+                    &control,
+                )
+            });
+            copy::FAIL_WRITE_AFTER.with(|n| n.set(None));
+            assert!(summary.disk_full);
+            assert_eq!((summary.done, summary.failed, summary.remaining), (1, 1, 1));
+            assert_eq!(
+                receiver
+                    .try_iter()
+                    .filter(|e| matches!(e, Event::Start { .. }))
+                    .count(),
+                2
+            );
+            assert_eq!(fs::read(backup_path.join("first")).unwrap(), b"completed");
+            assert!(!backup_path.join("last").exists());
+            if replace {
+                assert_eq!(fs::read(backup_path.join("large")).unwrap(), b"original");
+                assert_eq!(backup_index.entries[Path::new("large")].stamp.size, 8);
+            } else {
+                assert!(!backup_path.join("large").exists());
+            }
+            assert!(fs::read_dir(&backup_path).unwrap().all(|e| {
+                !e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(copy::PARTIAL_PREFIX)
+            }));
+            // Fresh observations, as a subsequent sync would use: completed work
+            // is skipped and the missing/rolled-back files are planned again.
+            let source_manifest = inventory(&source_path).finish();
+            let backup_manifest = inventory(&backup_path).finish();
+            let plan = plan::plan(&source_manifest, &backup_manifest, drive::Extras::Keep).unwrap();
+            let mut source_index = Index::new(source_manifest).unwrap();
+            let mut backup_index = Index::new(backup_manifest).unwrap();
+            assert_eq!(plan.unchanged, 1);
+            assert_eq!(plan.actions.len(), 2);
+            let mut rerun = Summary::default();
+            run_actions(&plan.actions, &control, &mut rerun, |action| {
+                apply(
+                    action,
+                    &source,
+                    &backup,
+                    history,
+                    &mut source_index,
+                    &mut backup_index,
+                    true,
+                    &control,
+                )
+            });
+            assert_eq!((rerun.done, rerun.failed), (2, 0));
+            assert!(!rerun.disk_full);
+            assert_eq!(
+                fs::read(backup_path.join("large")).unwrap(),
+                vec![42; 16 << 20]
+            );
+            assert_eq!(fs::read(backup_path.join("last")).unwrap(), b"later");
+            if replace {
+                assert_eq!(
+                    fs::read(backup_path.join(history).join("large")).unwrap(),
+                    b"original"
+                );
+            }
+            fs::remove_dir_all(temp).unwrap();
+        }
+    }
+
+    #[test]
+    fn ordinary_failure_does_not_stop_later_actions() {
+        let (events, _receiver) = mpsc::channel();
+        let (_confirm, replies) = mpsc::channel();
+        let control = Control {
+            events,
+            confirm: Mutex::new(replies),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let actions = vec![
+            Action::Copy {
+                path: "first".into(),
+                size: 1,
+            },
+            Action::Copy {
+                path: "last".into(),
+                size: 1,
+            },
+        ];
+        let mut summary = Summary::default();
+        run_actions(&actions, &control, &mut summary, |action| {
+            if action.path() == Path::new("first") {
+                Err(std::io::Error::from_raw_os_error(libc::EACCES)).context("Cannot copy")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!((summary.done, summary.failed), (1, 1));
+        assert!(!summary.disk_full);
+    }
 }

@@ -1098,10 +1098,113 @@ fn fill_refuses_a_source_destination_before_creating_anything() {
     };
     let filled = drive_work(move |ctl| engine::fill(options, ctl), true);
     assert!(
-        filled.failure().is_some_and(|m| m.contains("fill only writes to scratch disks")),
+        filled
+            .failure()
+            .is_some_and(|m| m.contains("fill only writes to scratch disks")),
         "{:?}",
         filled.failure()
     );
     assert!(!a.root.join("new").exists(), "a source gained a directory");
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn insufficient_space_is_reviewable_and_rechecked_before_transfer() {
+    use std::io::Write;
+    let _guard = HOME.lock().unwrap_or_else(|p| p.into_inner());
+    let home = home();
+    unsafe { std::env::set_var("HOME", &home) };
+    let a = RamDisk::new("space-src");
+    let b = RamDisk::new("space-bak");
+    let source = Drive::init(&a.root, Role::Source, None).unwrap();
+    Drive::init(&b.root, Role::Backup, Some(&source)).unwrap();
+    let media = fs::File::create(a.root.join("large.mov")).unwrap();
+    let oversized = copy::space(&b.root).unwrap().1 * 2;
+    media.set_len(oversized).unwrap(); // Sparse: metadata-only scan need not read it.
+    let refused = sync(&a.root, &b.root, true);
+    let preview = refused
+        .events
+        .iter()
+        .position(|e| matches!(e, Event::Planned(_)))
+        .unwrap();
+    let failure = refused
+        .events
+        .iter()
+        .position(|e| matches!(e, Event::Failed(_)))
+        .unwrap();
+    assert!(preview < failure);
+    assert!(refused.failure().unwrap().contains("Insufficient space"));
+    assert!(refused.events.iter().any(
+        |e| matches!(e, Event::Planned(p) if p.notes.iter().any(|n| n.contains("available")))
+    ));
+    assert!(
+        !refused
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Start { .. }))
+    );
+    assert!(!b.root.join("large.mov").exists());
+    let declined = sync(&a.root, &b.root, false);
+    assert!(declined.summary().cancelled);
+    assert!(declined.failure().is_none());
+
+    // Exercise a real APFS preallocation failure independently of preflight.
+    let source_root = safesync::filesystem::Root::open(&a.root).unwrap();
+    let backup_root = safesync::filesystem::Root::open(&b.root).unwrap();
+    let error = copy::copy_file(
+        &source_root.file(Path::new("large.mov"), false).unwrap(),
+        &backup_root.file(Path::new("large.mov"), true).unwrap(),
+        None,
+        false,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        error.chain().any(|e| e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.raw_os_error() == Some(libc::ENOSPC))),
+        "{error:#}"
+    );
+    assert!(!b.root.join("large.mov").exists());
+    assert!(fs::read_dir(&b.root).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(copy::PARTIAL_PREFIX)
+    }));
+
+    media.set_len(2 << 20).unwrap();
+    let filler = b.root.join("other-writer");
+    let changed = review_sync(&a.root, &b.root, || {
+        let mut file = fs::File::create(&filler).unwrap();
+        let block = vec![7; 1 << 20];
+        // Bound writes to this disposable RAM disk, then require real ENOSPC.
+        for _ in 0..128 {
+            if let Err(error) = file.write_all(&block) {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                return;
+            }
+        }
+        panic!("RAM disk did not fill");
+    });
+    assert!(changed.failure().unwrap().contains("Insufficient space"));
+    assert!(
+        !changed
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Start { .. }))
+    );
+    fs::remove_file(filler).unwrap();
+    let recovered = sync(&a.root, &b.root, true);
+    assert!(recovered.failure().is_none());
+    assert_eq!(
+        (recovered.summary().done, recovered.summary().failed),
+        (1, 0)
+    );
+    assert_eq!(
+        fs::metadata(b.root.join("large.mov")).unwrap().len(),
+        2 << 20
+    );
+    fs::remove_dir_all(home).unwrap();
 }

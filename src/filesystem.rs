@@ -284,12 +284,12 @@ impl Root {
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
             {
                 let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
-                ensure!(
-                    result == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST),
-                    "Cannot create directory: {}",
-                    std::io::Error::last_os_error()
-                );
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(error).context("Cannot create directory");
+                    }
+                }
                 fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
             }
             ensure!(
@@ -386,11 +386,9 @@ impl FilePath {
                 0o600,
             )
         };
-        ensure!(
-            fd >= 0,
-            "Cannot create partial file: {}",
-            std::io::Error::last_os_error()
-        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("Cannot create partial file");
+        }
         Ok((temp, unsafe { File::from_raw_fd(fd) }))
     }
 
@@ -408,21 +406,18 @@ impl FilePath {
                 libc::RENAME_EXCL,
             )
         };
-        ensure!(
-            result == 0,
-            "Cannot move file (existing destinations are never overwritten): {}",
-            std::io::Error::last_os_error()
-        );
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Cannot move file (existing destinations are never overwritten)");
+        }
         Ok(())
     }
 
     fn unlink(&self, flags: i32) -> Result<()> {
         let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), flags) };
-        ensure!(
-            result == 0,
-            "Cannot remove entry: {}",
-            std::io::Error::last_os_error()
-        );
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("Cannot remove entry");
+        }
         Ok(())
     }
 
