@@ -66,6 +66,8 @@ until the explicit migration below.
       backup/scratch exclusion fields are accepted but ignored; their sentinel
       files are not rewritten. Backup exclusions can no longer shrink the
       source's saved index.
+- [x] Scans and syncs run inside the drives screen, in a panel under the
+      table, rather than in a separate full-screen view (2026-09-25).
 - [ ] Guided setup: choose the originals drive, choose its backup, show the
       direction, then **Save and check backup**. The index refresh and the
       backup walk happen inside that flow; no per-disk indexing chore.
@@ -88,13 +90,14 @@ until the explicit migration below.
       Backup as its backup, **Check / sync**, compare the plan with
       `rclone-tower-safe --dry-run` before confirming. See "Before the first
       real run" above for what has to land first.
-- [ ] Scan recheck pass: after the walk, `scan.rs` reopens and stats every file
-      again and aborts on any change anywhere. On Tower that is a second
-      1.5 M-file metadata pass over USB, and one Spotlight or Finder touch fails
-      the whole sync closed. `copy_file` already rechecks each file's stamp
-      immediately before reading it, so decide: recheck directories only
-      (their mtime moves on any add, remove or rename underneath) and drop the
-      per-file pass, or keep it and accept the cost. Note the decision here.
+- [x] Scan recheck pass: decided 2026-09-25. The per-file pass after the walk
+      is gone; only directories are rechecked (their mtime moves on any add,
+      remove or rename underneath), with progress shown. Every file's stamp is
+      still rechecked immediately before it is read for a copy or fingerprint.
+      Reason: on Tower the file pass reopened 1.5 M paths component by
+      component with no progress, so a scan looked hung for many minutes, and
+      Esc could not stop it because scans ignored the cancel flag. Scans now
+      stop on Esc between directories and files, and nothing is published.
 
 ## Other work
 

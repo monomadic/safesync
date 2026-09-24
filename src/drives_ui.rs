@@ -2,15 +2,18 @@
 //! index; assign a role to an unmarked disk, start a scan, or search every
 //! saved index for a file while the drives are in a drawer.
 //!
-//! Role setup writes a sentinel; scanning and syncing hand off to the engine.
-//! Sync always opens the ordinary preview and requires confirmation to copy.
+//! Role setup writes a sentinel; scanning and syncing run the engine on a
+//! background thread and show its progress in a panel under the table, so the
+//! drive list never goes away. Sync always shows the preview in that panel and
+//! requires confirmation to copy.
 use crate::{
     drive::{Drive, Role},
     drives::{
         Details, Inventory, Marking, Relation, Row, Section, Tone, ago, date, group, size, time,
     },
-    engine::human,
-    ui::{DIM, ERR, FREE, LABEL, NAME, OK, PCT, SPEED, WARN},
+    engine::{self, Control, Event, Phase, human},
+    scan::Hashing,
+    ui::{self, DIM, ERR, FREE, LABEL, NAME, OK, PCT, SPEED, WARN},
 };
 use anyhow::Result;
 use crossterm::event::{self, Event as Input, KeyCode, KeyEventKind, KeyModifiers};
@@ -24,7 +27,11 @@ use ratatui::{
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -118,10 +125,101 @@ enum Focus {
     Drive(usize),
 }
 
+/// A scan or sync running on its own thread, shown in a panel under the table.
+struct Work {
+    model: ui::Model,
+    events: mpsc::Receiver<Event>,
+    confirm: mpsc::Sender<bool>,
+    cancel: Arc<AtomicBool>,
+    answered: bool,
+}
+impl Work {
+    fn start(verb: &'static str, work: impl FnOnce(Control) + Send + 'static) -> Self {
+        let ui::Session {
+            control,
+            events,
+            confirm,
+            cancel,
+        } = ui::Session::new();
+        std::thread::spawn(move || work(control));
+        Self {
+            model: ui::Model::new(verb),
+            events,
+            confirm,
+            cancel,
+            answered: false,
+        }
+    }
+    /// Drain the engine's events. Returns whether anything arrived.
+    fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.events.try_recv() {
+            self.model.apply(event);
+            changed = true;
+        }
+        self.model.refresh_disk();
+        changed
+    }
+    fn phase(&self) -> Phase {
+        self.model.phase
+    }
+    /// Keys while the panel is up. Returns `true` when the key was consumed.
+    fn key(&mut self, code: KeyCode, quit: bool) -> bool {
+        match self.phase() {
+            Phase::Review => match code {
+                KeyCode::Enter | KeyCode::Char('y') if !self.answered => {
+                    self.answered = true;
+                    let _ = self.confirm.send(true);
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.model.list.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.model.list.select_previous(),
+                KeyCode::PageDown => self.model.list.scroll_down_by(20),
+                KeyCode::PageUp => self.model.list.scroll_up_by(20),
+                _ if quit && !self.answered => {
+                    self.answered = true;
+                    let _ = self.confirm.send(false);
+                }
+                _ => return false,
+            },
+            Phase::Scanning | Phase::Transfer | Phase::Indexing => {
+                if quit {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    let note = match self.phase() {
+                        Phase::Scanning => "Stopping the scan; nothing is written…",
+                        _ => "Stopping after the current file…",
+                    };
+                    self.model.push_log(false, note.into());
+                } else {
+                    return false;
+                }
+            }
+            Phase::Done => return false,
+        }
+        true
+    }
+    /// One line for the status bar once the work is over.
+    fn outcome(&self) -> (bool, String) {
+        if let Some(error) = &self.model.error {
+            return (false, format!("{} failed: {error}", self.model.verb));
+        }
+        match &self.model.summary {
+            Some(s) if s.cancelled => (false, format!("{} cancelled.", self.model.verb)),
+            Some(s) if s.disk_full => (false, format!("{} incomplete: destination full.", self.model.verb)),
+            Some(s) if s.failed > 0 => (false, format!("{} finished with {} failures.", self.model.verb, s.failed)),
+            Some(s) if self.model.verb == "scan" => (true, format!("Indexed {} files.", s.done)),
+            Some(s) if s.done == 0 => (true, "Already in sync.".into()),
+            Some(s) => (true, format!("Synced {} files, {}.", s.done, human(s.bytes))),
+            None => (false, format!("{} ended without a result.", self.model.verb)),
+        }
+    }
+}
+
 struct Screen {
     icons: bool,
     hit: Option<crate::paths::SearchHit>,
     inventory: Inventory,
+    /// A scan or sync in progress, drawn under the table.
+    work: Option<Work>,
     /// The full indexes, still being parsed on a background thread.
     pending: Option<mpsc::Receiver<Details>>,
     sections: Vec<Section>,
@@ -146,6 +244,7 @@ impl Screen {
             hit: None,
             sections: inventory.sections(),
             inventory,
+            work: None,
             pending: None,
             collapsed: HashSet::from(["system".into()]),
             selected: Focus::Drive(0),
@@ -358,6 +457,40 @@ impl Screen {
     fn say(&mut self, ok: bool, text: impl Into<String>) {
         self.status = Some((ok, text.into()));
     }
+    fn start_scan(&mut self, root: PathBuf, hash: bool) {
+        let hashing = if hash { Hashing::Missing } else { Hashing::Known };
+        self.work = Some(Work::start("scan", move |control| {
+            engine::index_drive(root, hashing, false, control)
+        }));
+    }
+    fn start_sync(&mut self, source: PathBuf, backup: PathBuf) {
+        let options = engine::SyncOptions {
+            source,
+            backup,
+            hashing: Hashing::Known,
+            rehash: false,
+            verify: false,
+        };
+        self.work = Some(Work::start("sync", move |control| engine::sync(options, control)));
+    }
+    /// Pull in the engine's events; when a run has just finished, keep the
+    /// panel up until a key dismisses it.
+    fn poll_work(&mut self) {
+        if let Some(work) = &mut self.work {
+            work.poll();
+        }
+    }
+    /// Close the panel after a run and show the drives as they are now.
+    fn finish_work(&mut self) {
+        if let Some(work) = self.work.take() {
+            let (ok, text) = work.outcome();
+            self.reload();
+            self.say(ok, text);
+        }
+    }
+    fn busy(&self) -> bool {
+        self.work.as_ref().is_some_and(|w| w.phase() != Phase::Done)
+    }
 
     /// Write the sentinel. `source` is the row a backup mirrors.
     fn assign(&mut self, row: usize, role: Role, source: Option<usize>) {
@@ -406,6 +539,23 @@ impl Screen {
             || code == KeyCode::Char('q')
             || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL));
         let max_scroll = self.scroll_limit();
+        if let Some(work) = &mut self.work
+            && matches!(self.mode, Mode::Table)
+        {
+            if work.phase() == Phase::Done {
+                if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) || quit {
+                    self.finish_work();
+                    return None;
+                }
+            } else if work.key(code, quit) {
+                return None;
+            }
+            if matches!(code, KeyCode::Char('y' | 's' | 'S' | 'r' | '/' | 'R')) {
+                let verb = work.model.verb;
+                self.say(false, format!("Wait for the {verb} to finish (Esc stops it)."));
+                return None;
+            }
+        }
         match &mut self.mode {
             Mode::Table => match code {
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -637,6 +787,19 @@ fn draw(frame: &mut Frame, screen: &mut Screen) {
     }
     draw_header(frame, rows[0], screen);
     match &screen.mode {
+        Mode::Table if screen.work.is_some() => {
+            let phase = screen.work.as_ref().unwrap().phase();
+            let panel = match phase {
+                Phase::Scanning | Phase::Indexing => Constraint::Length(10),
+                Phase::Review | Phase::Transfer | Phase::Done => Constraint::Percentage(55),
+            };
+            let parts = Layout::vertical([Constraint::Min(4), panel]).split(rows[1]);
+            draw_table(frame, parts[0], screen, width);
+            let work = screen.work.as_mut().unwrap();
+            let panel = Layout::vertical([Constraint::Length(2), Constraint::Min(2)]).split(parts[1]);
+            ui::draw_header(frame, panel[0], &work.model);
+            ui::draw_body(frame, panel[1], &mut work.model, width);
+        }
         Mode::Table => draw_table(frame, rows[1], screen, width),
         Mode::Details { scroll } => draw_details(frame, rows[1], screen, *scroll),
         Mode::Help { scroll } => {
@@ -1363,6 +1526,9 @@ fn draw_source(
 
 fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     let keys = match &screen.mode {
+        Mode::Table if screen.work.is_some() => {
+            format!("{}   ↑↓ Select   ? Help", ui::keys(&screen.work.as_ref().unwrap().model))
+        }
         Mode::Table => {
             let action = match screen.row() {
                 Some(row) if row.assign_refusal().is_none() => "r Assign role · d Details",
@@ -1393,7 +1559,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
             "─".repeat(width)
         }),
     };
-    let keys = if width < 60 && !matches!(screen.mode, Mode::Table) {
+    let keys = if screen.work.is_some() && matches!(screen.mode, Mode::Table) {
+        keys
+    } else if width < 60 && !matches!(screen.mode, Mode::Table) {
         match screen.mode {
             Mode::Details { .. } | Mode::Help { .. } => "↑↓ Scroll  Esc Back",
             Mode::Role { .. } | Mode::Source { .. } => "↑↓ Choose  Enter Confirm  Esc Back",
@@ -1434,6 +1602,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
                         | "←→"
                         | "Enter"
                         | "Esc"
+                        | "Enter/Esc"
                         | "d/Esc"
                         | "?/Esc"
                         | "PgUp/PgDn"
@@ -1456,7 +1625,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     }
 }
 
-/// The interactive screen. Returns when the user quits or asks for a scan/sync.
+/// The interactive screen. Scans and syncs run inside it; it returns when the
+/// user quits or asks for something that needs the terminal, like `fzf`.
 /// `focus` is the mount point to select first, when it is still there.
 pub fn run(
     focus: Option<&Path>,
@@ -1501,12 +1671,18 @@ pub fn run(
         loop {
             terminal.draw(|frame| draw(frame, &mut screen))?;
             screen.poll_details();
-            if event::poll(Duration::from_millis(250))?
+            screen.poll_work();
+            let tick = if screen.busy() { 100 } else { 250 };
+            if event::poll(Duration::from_millis(tick))?
                 && let Input::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
                 && let Some(action) = screen.key(key.code, key.modifiers)
             {
-                return Ok(action);
+                match action {
+                    Action::Scan { root, hash } => screen.start_scan(root, hash),
+                    Action::Sync { source, backup } => screen.start_sync(source, backup),
+                    other => return Ok(other),
+                }
             }
         }
     })();

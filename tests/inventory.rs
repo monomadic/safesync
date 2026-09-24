@@ -552,6 +552,9 @@ fn hashing_reports_exact_totals_after_the_walk() {
         &[],
         None,
         |p| match p.hashing {
+            None if p.checking.is_some() => {
+                assert_eq!(hash_reports.len() > 0, true, "the directory check follows hashing");
+            }
             None => {
                 walk_reports += 1;
                 assert!(hash_reports.is_empty(), "walk reports never follow hashing");
@@ -677,4 +680,29 @@ fn rename_pairing_consumes_candidates_once_and_preserves_ambiguity_guards() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn a_cancelled_scan_stops_without_a_manifest() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fixture = Fixture::new();
+    put(&fixture.root(), "a.bin", b"a");
+    put(&fixture.root(), "sub/b.bin", b"b");
+    let cancel = AtomicBool::new(false);
+    let mut reports = 0;
+    let result = scan::scan_cancellable(
+        &fixture.root(),
+        Fixture::volume(),
+        scan::Hashing::None,
+        &[],
+        None,
+        Some(&cancel),
+        |_| {
+            reports += 1;
+            cancel.store(true, Ordering::Relaxed);
+        },
+    );
+    let error = result.err().expect("a cancelled scan does not return a manifest");
+    assert!(format!("{error:#}").contains("Cancelled"), "{error:#}");
+    assert!(reports >= 1);
 }

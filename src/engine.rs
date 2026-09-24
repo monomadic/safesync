@@ -78,6 +78,8 @@ pub enum Event {
         /// The previous index's file count: what the walk is probably heading for.
         expected: Option<usize>,
         hashing: Option<scan::HashProgress>,
+        /// The closing pass over directories: (checked, total).
+        checking: Option<(usize, usize)>,
     },
     Planned(Overview),
     Start {
@@ -174,12 +176,13 @@ pub fn scan_drive(
     };
     let events = control.events.clone();
     let mut last = Instant::now();
-    scan::scan_with_reuse(
+    scan::scan_cancellable(
         &drive.root,
         drive.volume.clone(),
         hashing,
         exclusions,
         Some(&cache),
+        Some(&control.cancel),
         |p| {
             if last.elapsed().as_millis() >= 100 {
                 last = Instant::now();
@@ -190,6 +193,7 @@ pub fn scan_drive(
                     reused: p.reused,
                     expected,
                     hashing: p.hashing,
+                    checking: p.checking,
                 });
             }
         },
@@ -205,6 +209,7 @@ fn scanned(control: &Control, drive: usize, manifest: &Manifest) {
         reused: manifest.header.reused_hashes,
         expected: None,
         hashing: None,
+        checking: None,
     });
 }
 
@@ -255,9 +260,24 @@ pub fn index_drive(root: PathBuf, hashing: Hashing, rehash: bool, control: Contr
         });
         control.send(Event::Phase(Phase::Scanning));
         let started = Instant::now();
-        let mut manifest = scan_drive(&drive, 0, hashing, rehash, &drive.exclusions(), &control)?;
+        let scanned_manifest =
+            scan_drive(&drive, 0, hashing, rehash, &drive.exclusions(), &control);
+        if control.cancelled() {
+            control.send(Event::Log("Scan stopped; the previous index stands".into()));
+            control.send(Event::Done(Summary {
+                cancelled: true,
+                seconds: started.elapsed().as_secs_f64(),
+                ..Summary::default()
+            }));
+            return Ok(());
+        }
+        let mut manifest = scanned_manifest?;
         scanned(&control, 0, &manifest);
         control.send(Event::Phase(Phase::Indexing));
+        control.send(Event::Log(format!(
+            "Writing index for {} files",
+            manifest.entries.len()
+        )));
         let path = drive.publish(&mut manifest)?;
         control.send(Event::Log(format!(
             "{} files indexed, {} fingerprints reused → {}",
@@ -314,6 +334,11 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
     let mut source_manifest = source_manifest?;
     scanned(control, 0, &source_manifest);
     // A check refreshes the catalog even if the user declines the transfer.
+    control.send(Event::Log(format!(
+        "Writing {} index ({} files)",
+        source.sentinel.name,
+        source_manifest.entries.len()
+    )));
     source.publish(&mut source_manifest)?;
     let mut backup_manifest = backup_manifest?;
     scanned(control, 1, &backup_manifest);
@@ -500,6 +525,7 @@ fn fingerprint_rename_candidates(
             reused: 0,
             expected: None,
             hashing: Some(hashing),
+            checking: None,
         })
     };
     control.send(Event::Log(

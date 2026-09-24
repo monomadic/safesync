@@ -173,28 +173,8 @@ fn drives(icons: bool) -> Result<i32> {
                     notice = Some(format!("{error:#}"));
                 }
             }
-            Action::Scan { root, hash } => {
-                focus = Some(root.clone());
-                let hashing = if hash {
-                    Hashing::Missing
-                } else {
-                    Hashing::Known
-                };
-                ui::run("scan", true, move |control| {
-                    engine::index_drive(root, hashing, false, control)
-                })?;
-            }
-            Action::Sync { source, backup } => {
-                focus = Some(backup.clone());
-                let options = SyncOptions {
-                    source,
-                    backup,
-                    hashing: Hashing::Known,
-                    rehash: false,
-                    verify: false,
-                };
-                ui::run("sync", false, move |control| engine::sync(options, control))?;
-            }
+            // Scans and syncs run inside the drives screen now.
+            Action::Scan { .. } | Action::Sync { .. } => {}
         }
     }
 }

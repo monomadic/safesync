@@ -45,12 +45,15 @@ relationship, index coverage and location. From the table:
   previews the changes, and asks for confirmation before copying. No manual
   indexing is required first. It also works from the source or group heading
   when there is one linked backup; with several, select the intended backup.
-  Both drives must be mounted. After syncing or cancelling, the drive list returns.
+  Both drives must be mounted. The check, preview and copy run in a panel
+  under the drive table; Enter starts the copy, Esc cancels the preview or
+  stops after the current file, and Enter or Esc afterwards reloads the list.
 - `r` assigns a role to an unmarked disk (a backup then picks the mounted
   source it mirrors). Roles are never *changed* from here; that stays a
   deliberate edit of `drive.toml`.
-- `s` indexes the selected source (`S` also fingerprints files that have none),
-  then returns to the table.
+- `s` indexes the selected source (`S` also fingerprints files that have none)
+  in the same panel; Esc stops a scan between directories or files without
+  writing anything. The table stays visible and navigable meanwhile.
 - `/` hands source paths to `fzf --read0 --print0 --exact` after restoring the
   terminal. It searches the selected source (or its backup's source), including
   offline catalogs. A selection focuses its source row; `o` reveals it in Finder

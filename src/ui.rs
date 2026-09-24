@@ -116,17 +116,19 @@ struct ScanRow {
     hashing: Option<HashProgress>,
     hash_speed: Speed,
     hash_started: Option<Instant>,
+    /// The closing directory check: (checked, total).
+    checking: Option<(usize, usize)>,
 }
 
-struct Model {
-    verb: &'static str,
+pub(crate) struct Model {
+    pub(crate) verb: &'static str,
     sources: Vec<String>,
     destination: String,
     destination_path: Option<std::path::PathBuf>,
-    phase: Phase,
+    pub(crate) phase: Phase,
     scans: Vec<ScanRow>,
     overview: Option<Overview>,
-    list: ListState,
+    pub(crate) list: ListState,
     workers: Vec<Worker>,
     done: usize,
     failed: usize,
@@ -135,14 +137,14 @@ struct Model {
     total_items: usize,
     total_speed: Speed,
     log: VecDeque<(bool, String)>,
-    summary: Option<Summary>,
-    error: Option<String>,
+    pub(crate) summary: Option<Summary>,
+    pub(crate) error: Option<String>,
     disk: Option<(u64, u64)>,
     disk_checked: Instant,
 }
 
 impl Model {
-    fn new(verb: &'static str) -> Self {
+    pub(crate) fn new(verb: &'static str) -> Self {
         Self {
             verb,
             sources: Vec::new(),
@@ -166,13 +168,13 @@ impl Model {
             disk_checked: Instant::now() - Duration::from_secs(60),
         }
     }
-    fn push_log(&mut self, ok: bool, line: String) {
+    pub(crate) fn push_log(&mut self, ok: bool, line: String) {
         self.log.push_back((ok, line));
         while self.log.len() > 200 {
             self.log.pop_front();
         }
     }
-    fn apply(&mut self, event: Event) {
+    pub(crate) fn apply(&mut self, event: Event) {
         match event {
             Event::Drives {
                 sources,
@@ -193,11 +195,15 @@ impl Model {
                 reused,
                 expected,
                 hashing,
+                checking,
             } => {
                 if let Some(row) = self.scans.get_mut(drive) {
                     row.files = files;
                     row.bytes = bytes;
                     row.reused = reused;
+                    if checking.is_some() {
+                        row.checking = checking;
+                    }
                     if expected.is_some() {
                         row.expected = expected;
                     }
@@ -296,7 +302,7 @@ impl Model {
             }
         }
     }
-    fn refresh_disk(&mut self) {
+    pub(crate) fn refresh_disk(&mut self) {
         if self.disk_checked.elapsed() < Duration::from_secs(2) {
             return;
         }
@@ -359,16 +365,33 @@ fn draw(frame: &mut Frame, model: &mut Model) {
     ])
     .split(area);
     draw_header(frame, rows[0], model);
-    match model.phase {
-        Phase::Scanning => draw_scanning(frame, rows[1], model, width),
-        Phase::Review => draw_review(frame, rows[1], model, width),
-        Phase::Transfer | Phase::Indexing => draw_transfer(frame, rows[1], model, width),
-        Phase::Done => draw_done(frame, rows[1], model, width),
-    }
+    draw_body(frame, rows[1], model, width);
     draw_footer(frame, rows[2], model, width);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
+/// The phase-specific part of the screen, for embedding under another table.
+pub(crate) fn draw_body(frame: &mut Frame, area: Rect, model: &mut Model, width: usize) {
+    match model.phase {
+        Phase::Scanning => draw_scanning(frame, area, model, width),
+        // A scan has no transfer: writing its index belongs with the walk view.
+        Phase::Indexing if model.verb == "scan" => draw_scanning(frame, area, model, width),
+        Phase::Review => draw_review(frame, area, model, width),
+        Phase::Transfer | Phase::Indexing => draw_transfer(frame, area, model, width),
+        Phase::Done => draw_done(frame, area, model, width),
+    }
+}
+
+/// Key hints for the current phase, for a host screen's footer.
+pub(crate) fn keys(model: &Model) -> &'static str {
+    match model.phase {
+        Phase::Scanning => "Esc Stop scan",
+        Phase::Review => "Enter Start   ↑↓ Scroll   Esc Cancel",
+        Phase::Transfer | Phase::Indexing => "Esc Stop after the current file",
+        Phase::Done => "Enter/Esc Back to drives",
+    }
+}
+
+pub(crate) fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     let mut spans = vec![Span::styled(
         format!("safesync {} ", model.verb),
         Style::default().fg(NAME).add_modifier(Modifier::BOLD),
@@ -470,6 +493,10 @@ fn draw_scanning(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
                 // The walk: no total until it ends, but the last index is a good guess.
                 let (ratio, note) = match row.expected {
                     _ if finished => (1.0, "walk complete".to_string()),
+                    _ if let Some((checked, total)) = row.checking => (
+                        1.0,
+                        format!("walk complete, checking folders {checked} of {total}"),
+                    ),
                     Some(expected) if expected > 0 => (
                         (row.files as f64 / expected as f64).min(0.99),
                         format!("walking, ~{expected} files last time"),
@@ -497,6 +524,12 @@ fn draw_scanning(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
         "Only new or changed files are read; everything else comes from the last index.",
         Style::default().fg(DIM),
     )));
+    for (ok, line) in model.log.iter().rev().take(3).rev() {
+        lines.push(Line::from(Span::styled(
+            truncate(line, width),
+            Style::default().fg(if *ok { DIM } else { ERR }),
+        )));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -773,9 +806,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
 
 pub struct Session {
     pub control: Control,
-    events: Receiver<Event>,
-    confirm: Sender<bool>,
-    cancel: Arc<AtomicBool>,
+    pub(crate) events: Receiver<Event>,
+    pub(crate) confirm: Sender<bool>,
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 impl Session {
     pub fn new() -> Self {
@@ -886,7 +919,11 @@ fn run_screen(
                     },
                     _ if quit => {
                         cancel.store(true, Ordering::Relaxed);
-                        model.push_log(false, "Stopping after the current file…".into());
+                        let note = match model.phase {
+                            Phase::Scanning => "Stopping the scan; nothing is written…",
+                            _ => "Stopping after the current file…",
+                        };
+                        model.push_log(false, note.into());
                     }
                     _ => {}
                 }

@@ -4,8 +4,22 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ## Unreleased
 
+### Changed
+
+- Scans and syncs started from the drives screen now run in a panel under
+  the drive table instead of switching to a separate full-screen view. The
+  table stays visible, the preview and confirmation happen in the panel, and
+  dismissing the finished panel reloads the list.
+
 ### Fixed
 
+- A scan on a large drive appeared to hang after the walk: a silent second
+  pass reopened every file to check nothing had changed, showing no progress,
+  and Esc could not stop it because scans ignored the cancel flag. The
+  per-file pass is gone; only directories are rechecked, with progress shown,
+  and Esc now stops a scan between directories or files without publishing.
+- The screen now shows when an index is being written, and a sync logs the
+  same step, so the moments after a walk are no longer blank.
 - Sync now previews required and available space before refusing an oversized
   plan, and checks again at confirmation. A disk-full error stops subsequent
   actions after cleanup/rollback, reports an incomplete run, and preserves

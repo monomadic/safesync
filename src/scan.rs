@@ -8,6 +8,7 @@ use std::{
     fs::{self, File},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// How much reading a scan may do to obtain fingerprints.
@@ -32,6 +33,8 @@ pub struct Progress {
     pub reused: u64,
     /// Set once the walk is over and files are being read for fingerprints.
     pub hashing: Option<HashProgress>,
+    /// Set during the final pass over directories: (checked, total).
+    pub checking: Option<(usize, usize)>,
 }
 
 /// The second half of a `Hashing::Missing` scan. Totals are exact: the walk
@@ -141,9 +144,31 @@ pub fn scan_with_reuse(
     hashing: impl Into<Hashing>,
     exclusions: &[PathBuf],
     reuse: Option<&HashCache>,
+    progress: impl FnMut(Progress),
+) -> Result<Manifest> {
+    scan_cancellable(root, volume, hashing, exclusions, reuse, None, progress)
+}
+
+/// Stops with `Cancelled` as soon as `cancel` is set: between directories
+/// during the walk, between files while fingerprinting, and during the
+/// closing directory check. Nothing is published either way.
+pub fn scan_cancellable(
+    root: &Path,
+    volume: Volume,
+    hashing: impl Into<Hashing>,
+    exclusions: &[PathBuf],
+    reuse: Option<&HashCache>,
+    cancel: Option<&AtomicBool>,
     mut progress: impl FnMut(Progress),
 ) -> Result<Manifest> {
     let hashing = hashing.into();
+    let check_cancel = || -> Result<()> {
+        ensure!(
+            !cancel.is_some_and(|c| c.load(Ordering::Relaxed)),
+            "Cancelled"
+        );
+        Ok(())
+    };
     ensure!(
         reuse.is_none_or(|cache| cache.volume_uuid == volume.uuid),
         "Hash cache belongs to another volume"
@@ -175,6 +200,7 @@ pub fn scan_with_reuse(
     let mut reused = 0;
     let mut pending: Vec<usize> = Vec::new();
     while let Some(relative) = queue.pop() {
+        check_cancel()?;
         let parent = if relative.as_os_str().is_empty() {
             directory.try_clone()?
         } else {
@@ -239,6 +265,7 @@ pub fn scan_with_reuse(
                     bytes,
                     reused,
                     hashing: None,
+                    checking: None,
                 });
             }
         }
@@ -253,6 +280,7 @@ pub fn scan_with_reuse(
         ..HashProgress::default()
     };
     for index in pending {
+        check_cancel()?;
         let entry = &mut entries[index];
         let relative = entry.path()?;
         let mut opened = filesystem::open_relative(&directory, &relative, device)
@@ -264,6 +292,7 @@ pub fn scan_with_reuse(
                 bytes,
                 reused,
                 hashing: Some(hash),
+                checking: None,
             });
         })
         .with_context(|| format!("Cannot fingerprint {:?}", relative))?;
@@ -274,11 +303,19 @@ pub fn scan_with_reuse(
             bytes,
             reused,
             hashing: Some(hash),
+            checking: None,
         });
     }
-    // Catch changes during the scan rather than presenting a partial tree as a
-    // complete observation. This is not a filesystem snapshot or a write lock.
-    for (relative, expected) in &directories {
+    // Catch changes during the walk rather than presenting a partial tree as a
+    // complete observation. Directories are enough: any add, remove or rename
+    // beneath one moves its mtime. Files are not reopened here — on a
+    // 1.5 M-file drive that second pass cost more than the walk and showed no
+    // progress — because every file's stamp is rechecked immediately before
+    // it is read for a copy or a fingerprint. This is not a filesystem
+    // snapshot or a write lock.
+    let total = directories.len();
+    for (checked, (relative, expected)) in directories.iter().enumerate() {
+        check_cancel()?;
         let opened = if relative.as_os_str().is_empty() {
             directory.try_clone()?
         } else {
@@ -289,13 +326,13 @@ pub fn scan_with_reuse(
             "Directory changed during scan: {:?}; retry with a quiet source",
             relative
         );
-    }
-    for entry in &entries {
-        let opened = filesystem::open_relative(&directory, &entry.path()?, device)?;
-        ensure!(
-            Stamp::of(&opened.metadata()?) == entry.stamp,
-            "File changed during scan; no manifest was committed"
-        );
+        progress(Progress {
+            files: entries_count,
+            bytes,
+            reused,
+            hashing: None,
+            checking: Some((checked + 1, total)),
+        });
     }
     let current_root = File::open(&root)?.metadata()?;
     ensure!(
