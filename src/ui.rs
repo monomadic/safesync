@@ -567,8 +567,31 @@ fn draw_review(frame: &mut Frame, area: Rect, model: &mut Model, width: usize) {
     }
     notes.push(Line::default());
     frame.render_widget(Paragraph::new(notes), parts[0]);
-    let items: Vec<ListItem> = overview
-        .items
+    // Only the rows on screen are built: the plan can hold every file on a
+    // drive, and rebuilding all of them for each keypress made scrolling lag.
+    let border = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(EMPTY));
+    let inner = border.inner(parts[1]);
+    frame.render_widget(border, parts[1]);
+    let total = overview.items.len();
+    let rows = inner.height as usize;
+    if total == 0 || rows == 0 {
+        return;
+    }
+    let selected = model.list.selected().map(|i| i.min(total - 1));
+    let mut offset = model.list.offset().min(total - 1);
+    if let Some(selected) = selected {
+        if selected < offset {
+            offset = selected;
+        } else if selected >= offset + rows {
+            offset = selected + 1 - rows;
+        }
+    }
+    offset = offset.min(total.saturating_sub(rows));
+    *model.list.offset_mut() = offset;
+    model.list.select(selected);
+    let items: Vec<ListItem> = overview.items[offset..(offset + rows).min(total)]
         .iter()
         .map(|item| {
             let size = if item.size > 0 {
@@ -586,14 +609,9 @@ fn draw_review(frame: &mut Frame, area: Rect, model: &mut Model, width: usize) {
             ]))
         })
         .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(EMPTY)),
-        )
-        .highlight_style(Style::default().bg(Color::Rgb(0x1A, 0x1E, 0x2A)));
-    frame.render_stateful_widget(list, parts[1], &mut model.list);
+    let list = List::new(items).highlight_style(Style::default().bg(Color::Rgb(0x1A, 0x1E, 0x2A)));
+    let mut window = ListState::default().with_selected(selected.map(|s| s - offset));
+    frame.render_stateful_widget(list, inner, &mut window);
 }
 
 fn draw_transfer(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
@@ -1019,5 +1037,75 @@ fn run_plain(model: &mut Model, events: Receiver<Event>, confirm: Sender<bool>, 
                 let _ = confirm.send(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_window {
+    use super::*;
+    use crate::engine::Item;
+    use ratatui::backend::TestBackend;
+
+    fn model(count: usize) -> Model {
+        let mut model = Model::new("sync");
+        let items = (0..count)
+            .map(|i| Item {
+                kind: Kind::Copy,
+                path: format!("clips/take-{i:05}.mov"),
+                size: 24_000_000,
+            })
+            .collect();
+        model.apply(Event::Planned(Overview {
+            items,
+            transfer_bytes: 1,
+            notes: vec!["note".into()],
+        }));
+        model.phase = Phase::Review;
+        model
+    }
+    fn text(terminal: &ratatui::Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(terminal.backend().buffer().area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The review list only builds the rows on screen, so a plan with every
+    /// file on a drive scrolls as fast as a short one and still follows the
+    /// selection to either end.
+    #[test]
+    fn review_list_follows_selection_without_building_every_row() {
+        let mut model = model(80_000);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut model)).unwrap();
+        assert!(text(&terminal).contains("take-00000.mov"));
+        for _ in 0..30 {
+            model.list.select_next();
+            terminal.draw(|f| draw(f, &mut model)).unwrap();
+        }
+        assert_eq!(model.list.selected(), Some(30));
+        let shown = text(&terminal);
+        assert!(shown.contains("take-00030.mov"), "{shown}");
+        assert!(!shown.contains("take-00000.mov"), "{shown}");
+        model.list.select_last();
+        terminal.draw(|f| draw(f, &mut model)).unwrap();
+        let shown = text(&terminal);
+        assert_eq!(model.list.selected(), Some(79_999));
+        assert!(shown.contains("take-79999.mov"), "{shown}");
+        let start = Instant::now();
+        for _ in 0..20 {
+            model.list.select_previous();
+            terminal.draw(|f| draw(f, &mut model)).unwrap();
+        }
+        assert!(text(&terminal).contains("take-79979.mov"));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "20 frames took {:?}",
+            start.elapsed()
+        );
     }
 }

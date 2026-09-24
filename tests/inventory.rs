@@ -76,6 +76,18 @@ fn metadata_only_content_lookup_is_unknown_not_negative() {
     assert_eq!(report.unverified_candidates, 1);
 }
 #[test]
+fn ds_store_files_are_left_out_of_the_index() {
+    let f = Fixture::new();
+    fs::write(f.root().join(".DS_Store"), b"finder").unwrap();
+    fs::create_dir(f.root().join("clips")).unwrap();
+    fs::write(f.root().join("clips/.DS_Store"), b"finder").unwrap();
+    fs::write(f.root().join("clips/take.mov"), b"video").unwrap();
+    let manifest = f.scan(false);
+    let paths: Vec<_> = manifest.entries.iter().map(|e| e.path().unwrap()).collect();
+    assert_eq!(paths, [PathBuf::from("clips/take.mov")]);
+    assert!(manifest.header.exclusions.iter().any(|e| e.contains(".DS_Store")));
+}
+#[test]
 fn filename_query_does_not_claim_content_match() {
     let f = Fixture::new();
     fs::write(f.root().join("Film.mov"), b"anything").unwrap();

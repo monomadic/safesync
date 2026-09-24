@@ -118,7 +118,8 @@ impl HashCache {
 }
 
 // No ignored errors, hidden-file rules, or incomplete manifest publication.
-// The only implicit scope exclusions are our metadata and non-regular objects.
+// The only implicit scope exclusions are our metadata, Finder's .DS_Store
+// files, and non-regular objects.
 pub fn scan(
     root: &Path,
     volume: Volume,
@@ -209,7 +210,8 @@ pub fn scan_cancellable(
         for name in
             filesystem::names(&parent).with_context(|| format!("Cannot list {:?}", relative))?
         {
-            if name == ".safesync" {
+            // Finder's per-folder metadata is noise on every drive, never media.
+            if name == ".safesync" || name == ".DS_Store" {
                 continue;
             }
             let child = relative.join(&name);
@@ -357,6 +359,7 @@ pub fn scan_cancellable(
                 && entries.iter().all(|entry| entry.sha256.is_some()),
             exclusions: vec![
                 "Any directory or file named .safesync".into(),
+                "Finder metadata files named .DS_Store".into(),
                 "Symlinks and special files".into(),
                 "Other mounted filesystems".into(),
             ]
