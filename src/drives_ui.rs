@@ -31,6 +31,12 @@ use std::{
 /// What the caller does after the screen closes.
 pub enum Action {
     Quit,
+    Search {
+        source_uuid: Option<String>,
+    },
+    Reveal {
+        hit: crate::paths::SearchHit,
+    },
     /// Run the scan screen on this root (`hash`: read files that have no fingerprint yet).
     Scan {
         root: PathBuf,
@@ -59,7 +65,6 @@ const ROLES: [(Role, &str, &str); 3] = [
         "working disk. written only by `fill`",
     ),
 ];
-const SEARCH_LIMIT: usize = 500;
 // SF Symbols glyphs supplied for the terminal's font fallback.
 const DRIVE_LOCAL: &str = "􀤂";
 const DRIVE_ALERT: &str = "􁘧";
@@ -105,10 +110,6 @@ enum Mode {
         sources: Vec<usize>,
         choice: usize,
     },
-    Search {
-        query: String,
-        selected: usize,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +120,7 @@ enum Focus {
 
 struct Screen {
     icons: bool,
+    hit: Option<crate::paths::SearchHit>,
     inventory: Inventory,
     /// The full indexes, still being parsed on a background thread.
     pending: Option<mpsc::Receiver<Details>>,
@@ -141,6 +143,7 @@ impl Screen {
     fn from_inventory(inventory: Inventory) -> Self {
         let mut screen = Self {
             icons: true,
+            hit: None,
             sections: inventory.sections(),
             inventory,
             pending: None,
@@ -381,9 +384,14 @@ impl Screen {
                 self.say(
                     true,
                     format!(
-                        "{} is now a {} drive. Next: s to scan it.",
+                        "{} is now a {} drive. {}",
                         drive.sentinel.name,
-                        ROLES[role_index(role)].1.trim()
+                        ROLES[role_index(role)].1.trim(),
+                        match role {
+                            Role::Source => "Next: s to index, or y to check / sync.",
+                            Role::Backup => "Next: y to check / sync.",
+                            Role::Scratch => "Ready for fill.",
+                        }
                     ),
                 );
             }
@@ -458,15 +466,21 @@ impl Screen {
                     }
                 }
                 KeyCode::Char('/') => {
-                    if self.inventory.catalog.is_empty() && self.reading() {
-                        self.say(false, "Still reading the indexes; try again in a moment.");
-                    } else if self.inventory.catalog.is_empty() {
-                        self.say(false, "No indexes to search yet; scan a drive first.");
-                    } else {
-                        self.mode = Mode::Search {
-                            query: String::new(),
-                            selected: 0,
-                        };
+                    return Some(Action::Search {
+                        source_uuid: self.row().and_then(|r| {
+                            if r.role() == Some(Role::Source) {
+                                r.uuid.clone()
+                            } else {
+                                r.source_uuid().map(str::to_owned)
+                            }
+                        }),
+                    });
+                }
+                KeyCode::Char('o') => {
+                    if let Some(hit) = self.hit.as_ref().filter(|h| {
+                        self.row().and_then(|r| r.uuid.as_deref()) == Some(h.uuid.as_str())
+                    }) {
+                        return Some(Action::Reveal { hit: hit.clone() });
                     }
                 }
                 KeyCode::Char('R') => {
@@ -532,36 +546,6 @@ impl Screen {
                     self.mode = Mode::Role {
                         row: *row,
                         choice: role_index(Role::Backup),
-                    }
-                }
-                _ => {}
-            },
-            Mode::Search { query, selected } => match code {
-                KeyCode::Esc => self.mode = Mode::Table,
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Some(Action::Quit);
-                }
-                KeyCode::Down => *selected += 1,
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::PageDown => *selected += 20,
-                KeyCode::PageUp => *selected = selected.saturating_sub(20),
-                KeyCode::Backspace => {
-                    query.pop();
-                    *selected = 0;
-                }
-                KeyCode::Char(c) => {
-                    query.push(c);
-                    *selected = 0;
-                }
-                KeyCode::Enter => {
-                    // Jump to the drive that holds the highlighted file.
-                    let results = self.inventory.catalog.search(query, SEARCH_LIMIT);
-                    if let Some(record) =
-                        results.get((*selected).min(results.len().saturating_sub(1)))
-                    {
-                        let row = record.row;
-                        self.focus_row(row);
-                        self.mode = Mode::Table;
                     }
                 }
                 _ => {}
@@ -669,9 +653,6 @@ fn draw(frame: &mut Frame, screen: &mut Screen) {
             sources,
             choice,
         } => draw_source(frame, rows[1], screen, *row, sources, *choice),
-        Mode::Search { query, selected } => {
-            draw_search(frame, rows[1], screen, query, *selected, width)
-        }
     }
     draw_footer(frame, rows[2], screen, width);
 }
@@ -808,13 +789,20 @@ fn backup_status(row: &Row, reading: bool) -> Option<(String, Color)> {
 }
 
 fn index_status(screen: &Screen, row: &Row) -> String {
+    if row.role() == Some(Role::Backup) {
+        return "Check with y".into();
+    }
+    if row.role() == Some(Role::Scratch) {
+        return "—".into();
+    }
     match &row.index {
         Some(_) if screen.reading() => "Loading…".into(),
         Some(index) => format!(
             "Indexed {}",
             ago(index.finished_unix, screen.inventory.loaded_unix)
         ),
-        None if row.role() == Some(Role::Backup) => "No saved index".into(),
+        None if row.role() == Some(Role::Backup) => "Check with y".into(),
+        None if row.role() == Some(Role::Scratch) => "—".into(),
         None if row.role().is_some() => "Not indexed".into(),
         None => "—".into(),
     }
@@ -1053,28 +1041,8 @@ fn summary_lines(screen: &Screen, row: &Row) -> Vec<Line<'static>> {
     if let Some((status, color)) = backup_status(row, screen.reading()) {
         lines.push(Line::from(value(status, color)));
         lines.push(Line::from(label(
-            "Live content not compared; using saved indexes.",
+            "Press y to check the mounted backup before syncing.",
         )));
-        let source_age = row
-            .source_uuid()
-            .and_then(|uuid| {
-                screen
-                    .inventory
-                    .rows
-                    .iter()
-                    .find(|r| r.uuid.as_deref() == Some(uuid))
-            })
-            .and_then(|r| r.index.as_ref())
-            .map(|i| ago(i.finished_unix, screen.inventory.loaded_unix))
-            .unwrap_or_else(|| "unknown".into());
-        let backup_age = row
-            .index
-            .as_ref()
-            .map(|i| ago(i.finished_unix, screen.inventory.loaded_unix))
-            .unwrap_or_else(|| "never".into());
-        lines.push(Line::from(label(&format!(
-            "Last scans: source {source_age} · backup {backup_age}"
-        ))));
     } else {
         let message = match &row.marking {
             Marking::Unmarked if !row.writable => "Read-only volume · cannot assign a role".into(),
@@ -1165,7 +1133,7 @@ fn details_lines(screen: &Screen) -> Vec<Line<'static>> {
     }
     if let Some(index) = &row.index {
         lines.push(Line::from(label(&format!(
-            "index-{}.jsonl",
+            "Generation {}",
             index.generation
         ))));
         lines.push(Line::from(label(&format!(
@@ -1236,17 +1204,15 @@ fn help_lines(screen: &Screen) -> Vec<Line<'static>> {
             "           Checks both drives, then asks before copying; no manual indexing needed",
         )),
         Line::from(label(
-            "s          Scan metadata and reuse known fingerprints",
+            "s          Index a source and reuse known fingerprints",
         )),
-        Line::from(label(
-            "S          Scan and fingerprint files missing a fingerprint",
-        )),
+        Line::from(label("S          Index a source and fingerprint new files")),
         Line::from(label("r          Assign a role to an unassigned drive")),
         Line::from(label(
             "d          Index details; ↑↓ / PgUp / PgDn to scroll",
         )),
         Line::from(label(
-            "/          Search all saved indexes, including offline drives",
+            "/          Search source paths with fzf; o reveals the selected file",
         )),
         Line::from(label("R          Reload mounted drives and saved indexes")),
         Line::from(label(
@@ -1395,97 +1361,6 @@ fn draw_source(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_search(
-    frame: &mut Frame,
-    area: Rect,
-    screen: &Screen,
-    query: &str,
-    selected: usize,
-    width: usize,
-) {
-    let results = screen.inventory.catalog.search(query, SEARCH_LIMIT);
-    let selected = selected.min(results.len().saturating_sub(1));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("  "),
-            label("search  "),
-            Span::styled(
-                format!("{query}▏"),
-                Style::default().fg(NAME).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(dim(if query.trim().is_empty() {
-            format!(
-                "  Type part of a file name or path. Every saved index is searched — {} files across {} drives, mounted or not.",
-                group(screen.inventory.catalog.len() as u64),
-                screen
-                    .inventory
-                    .rows
-                    .iter()
-                    .filter(|r| r.index.is_some())
-                    .count()
-            )
-        } else if results.is_empty() {
-            "  Nothing recorded under that name. Indexes describe what was there at scan time, not the disk right now.".into()
-        } else if results.len() >= SEARCH_LIMIT {
-            format!("  first {SEARCH_LIMIT} matches — keep typing to narrow")
-        } else {
-            format!(
-                "  {} match{}",
-                results.len(),
-                if results.len() == 1 { "" } else { "es" }
-            )
-        })),
-        Line::default(),
-    ];
-    let height = (area.height as usize).saturating_sub(lines.len());
-    let first = selected
-        .saturating_sub(height.saturating_sub(1))
-        .min(results.len().saturating_sub(height));
-    let name_width = results
-        .iter()
-        .map(|r| Line::from(screen.name(&screen.inventory.rows[r.row])).width())
-        .max()
-        .unwrap_or(4)
-        .clamp(4, 24);
-    for (i, record) in results.iter().enumerate().skip(first).take(height) {
-        let row = &screen.inventory.rows[record.row];
-        let is_selected = i == selected;
-        let online = row.online();
-        let fixed = 2 + name_width + 2 + 9 + 2 + 8 + 2;
-        let path_width = width.saturating_sub(fixed).max(10);
-        lines.push(Line::from(vec![
-            Span::styled(
-                if is_selected { "▸ " } else { "  " },
-                Style::default().fg(PCT),
-            ),
-            Span::styled(
-                pad(&screen.name(row), name_width),
-                Style::default()
-                    .fg(if online { role_color(row.role()) } else { DIM })
-                    .add_modifier(if is_selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::raw("  "),
-            value(
-                pad(if online { "mounted" } else { "offline" }, 9),
-                if online { OK } else { DIM },
-            ),
-            Span::raw("  "),
-            value(right(&human(record.size), 8), LABEL),
-            Span::raw("  "),
-            Span::styled(
-                shorten(&record.path, path_width),
-                Style::default().fg(if is_selected { NAME } else { LABEL }),
-            ),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
 fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     let keys = match &screen.mode {
         Mode::Table => {
@@ -1506,7 +1381,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
         Mode::Help { .. } => "↑↓ Scroll   ?/Esc Back".into(),
         Mode::Role { .. } => "↑↓ Choose   Enter Confirm   Esc Cancel".into(),
         Mode::Source { .. } => "↑↓ Choose   Enter Confirm   Esc Back".into(),
-        Mode::Search { .. } => "Type to search   ↑↓ Select   Enter Go to drive   Esc Back".into(),
     };
     let first = match &screen.status {
         Some((ok, text)) => value(shorten(text, width), if *ok { OK } else { ERR }),
@@ -1523,7 +1397,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
         match screen.mode {
             Mode::Details { .. } | Mode::Help { .. } => "↑↓ Scroll  Esc Back",
             Mode::Role { .. } | Mode::Source { .. } => "↑↓ Choose  Enter Confirm  Esc Back",
-            Mode::Search { .. } => "↑↓ Select  Enter Open  Esc Back",
             Mode::Table => unreachable!(),
         }
         .to_owned()
@@ -1585,9 +1458,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
 
 /// The interactive screen. Returns when the user quits or asks for a scan/sync.
 /// `focus` is the mount point to select first, when it is still there.
-pub fn run(focus: Option<&Path>, icons: bool) -> Result<Action> {
+pub fn run(
+    focus: Option<&Path>,
+    icons: bool,
+    hit: Option<&crate::paths::SearchHit>,
+    notice: Option<&str>,
+) -> Result<Action> {
     let mut screen = Screen::new();
     screen.icons = icons;
+    screen.hit = hit.cloned();
+    if let Some(hit) = hit {
+        if let Some(i) = screen
+            .inventory
+            .rows
+            .iter()
+            .position(|r| r.uuid.as_deref() == Some(hit.uuid.as_str()))
+        {
+            screen.focus_row(i);
+        }
+        screen.say(true, format!("{:?} · o Reveal in Finder", hit.relative));
+    }
+    if let Some(notice) = notice {
+        screen.say(false, notice);
+    }
     if let Some(i) = focus.and_then(|f| {
         screen
             .inventory
@@ -1666,7 +1559,7 @@ mod tests {
     use super::*;
     use crate::{
         drive::{Extras, Sentinel},
-        drives::{Catalog, IndexStats},
+        drives::IndexStats,
         manifest::RecordedDrive,
     };
     use ratatui::{Terminal, backend::TestBackend};
@@ -1736,7 +1629,6 @@ mod tests {
                 drive("Tower", "tower", None, None),
                 drive("Tower Backup", "tower-backup", None, None),
             ],
-            catalog: Catalog::new(),
             loaded_unix: 54_200,
             warnings: vec![],
         }
@@ -1765,7 +1657,6 @@ mod tests {
         assert!(!text.contains("No saved comparison"), "{text}");
         sender
             .send(Details {
-                catalog: Catalog::new(),
                 bytes: vec![None; 5],
                 comparisons: vec![
                     None,
@@ -2007,9 +1898,8 @@ mod tests {
         assert_eq!(screen.selected, Focus::Drive(2));
         key(&mut screen, KeyCode::Down);
         assert_eq!(screen.selected, Focus::Drive(1));
-        assert!(
-            matches!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE), Some(Action::Scan { root, hash: false }) if root.ends_with("DemoBackup"))
-        );
+        assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
+        assert!(screen.status.as_ref().unwrap().1.contains("only sources"));
         key(&mut screen, KeyCode::Left);
         assert_eq!(screen.selected, Focus::Section("source:source".into()));
         assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
@@ -2025,33 +1915,16 @@ mod tests {
         );
     }
     #[test]
-    fn search_reveals_a_drive_inside_a_collapsed_group() {
+    fn search_hands_off_to_the_selected_source() {
         let mut screen = Screen::from_inventory(inventory());
-        let root = std::env::temp_dir().join(crate::manifest::generation());
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("clip.mov"), b"video").unwrap();
-        let manifest = crate::scan::scan(
-            &root,
-            crate::filesystem::Volume {
-                uuid: "backup".into(),
-                name: "DemoBackup".into(),
-                filesystem: "apfs".into(),
-            },
-            false,
-            |_| {},
-        )
-        .unwrap();
-        screen.inventory.catalog.add(1, &manifest);
-        std::fs::remove_dir_all(root).unwrap();
-        screen.collapsed.insert("source:source".into());
-        key(&mut screen, KeyCode::Char('/'));
-        for ch in "clip".chars() {
-            key(&mut screen, KeyCode::Char(ch));
-        }
-        key(&mut screen, KeyCode::Enter);
-        assert_eq!(screen.selected, Focus::Drive(1));
-        assert!(screen.items().contains(&Focus::Drive(1)));
-        assert!(matches!(screen.mode, Mode::Table));
+        screen.focus_row(1); // backup links to source
+        assert!(
+            matches!(screen.key(KeyCode::Char('/'), KeyModifiers::NONE), Some(Action::Search { source_uuid: Some(uuid) }) if uuid == "source")
+        );
+        screen.focus_row(2);
+        assert!(
+            matches!(screen.key(KeyCode::Char('/'), KeyModifiers::NONE), Some(Action::Search { source_uuid: Some(uuid) }) if uuid == "source")
+        );
     }
     #[test]
     fn reload_tracks_uuid_through_reorder_and_renamed_group() {
@@ -2094,7 +1967,7 @@ mod tests {
             }
             if width >= 80 {
                 assert!(text.contains("saved indexes"));
-                assert!(text.contains("content not compared"));
+                assert!(text.contains("check the mounted backup"));
                 assert!(!text.contains("index-123"));
                 assert!(!text.contains("Macintosh HD"));
             }

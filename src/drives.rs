@@ -14,7 +14,7 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
 };
 
@@ -180,7 +180,8 @@ impl Row {
     }
     pub fn scan_refusal(&self) -> Option<&'static str> {
         match &self.marking {
-            Marking::Valid(_) => None,
+            Marking::Valid(s) if s.role == Role::Source => None,
+            Marking::Valid(_) => Some("only sources are indexed; use y to check a backup"),
             Marking::Unmarked => Some("no sentinel yet; assign a role first"),
             Marking::Offline => Some("not mounted"),
             _ => self.assign_refusal(),
@@ -222,8 +223,15 @@ impl Row {
                 if !self.writable {
                     return ("read-only volume".into(), Tone::Warn);
                 }
+                if sentinel.role == Role::Scratch {
+                    return ("ready for fill".into(), Tone::Neutral);
+                }
                 let Some(index) = &self.index else {
-                    return ("no index yet".into(), Tone::Warn);
+                    return if sentinel.role == Role::Backup {
+                        ("check / sync with y".into(), Tone::Neutral)
+                    } else {
+                        ("no index yet".into(), Tone::Warn)
+                    };
                 };
                 if sentinel.role == Role::Backup {
                     return match &self.relation {
@@ -256,7 +264,7 @@ impl Row {
                         Relation::Backup {
                             source_name: None, ..
                         } => ("source unknown".into(), Tone::Warn),
-                        _ => ("source not indexed".into(), Tone::Dim),
+                        _ => ("check / sync with y".into(), Tone::Neutral),
                     };
                 }
                 let age = now.saturating_sub(index.finished_unix);
@@ -271,66 +279,8 @@ impl Row {
     }
 }
 
-/// One indexed file, for the search screen.
-#[derive(Clone, Debug)]
-pub struct Record {
-    pub row: usize,
-    pub path: String,
-    pub size: u64,
-    pub hashed: bool,
-}
-
-/// Every indexed file across every known drive, mounted or not.
-#[derive(Default)]
-pub struct Catalog {
-    records: Vec<Record>,
-    lower: Vec<String>,
-}
-impl Catalog {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn add(&mut self, row: usize, manifest: &Manifest) {
-        for entry in &manifest.entries {
-            let path = entry
-                .path()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| entry.path_base64.clone());
-            self.lower.push(path.to_lowercase());
-            self.records.push(Record {
-                row,
-                path,
-                size: entry.stamp.size,
-                hashed: entry.sha256.is_some(),
-            });
-        }
-    }
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-    /// Case-insensitive substring match on the whole relative path; every
-    /// whitespace-separated word must appear. Up to `limit` results in index order.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<&Record> {
-        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        if words.is_empty() {
-            return Vec::new();
-        }
-        self.lower
-            .iter()
-            .zip(&self.records)
-            .filter(|(lower, _)| words.iter().all(|w| lower.contains(w.as_str())))
-            .map(|(_, record)| record)
-            .take(limit)
-            .collect()
-    }
-}
-
 pub struct Inventory {
     pub rows: Vec<Row>,
-    pub catalog: Catalog,
     pub loaded_unix: u64,
     pub warnings: Vec<String>,
 }
@@ -438,8 +388,7 @@ impl Inventory {
         sections
     }
 
-    /// Everything at once: the summaries and then the full indexes, on the
-    /// calling thread. For a pipe, a script or a test; the screen uses `start`.
+    /// Load volume metadata and index summaries without reading entry tables.
     pub fn load() -> Self {
         let (mut inventory, pending) = Self::start();
         if let Ok(details) = pending.recv() {
@@ -448,19 +397,13 @@ impl Inventory {
         inventory
     }
 
-    /// The screen's entry point. Returns immediately with every row filled
-    /// from index *summaries* (header and footer: date, file count, byte
-    /// total), and a receiver that delivers the parts needing every entry —
-    /// the search catalog and the backup comparisons — once a background
-    /// thread has parsed the indexes. Until `absorb` runs, `catalog` is empty
-    /// and every backup's `behind`/`estimate` is `None`.
+    /// The screen reads summaries only. Search and live backup checks are
+    /// explicit handoffs; saved backup catalogs do not establish current state.
     pub fn start() -> (Self, mpsc::Receiver<Details>) {
         let now = manifest::now();
         let mut warnings = Vec::new();
         let library = library_summaries(&mut warnings);
         let mut rows = Vec::new();
-        // The index behind each row, to be parsed in full off-thread.
-        let mut sources: Vec<Option<PathBuf>> = Vec::new();
 
         for mount in filesystem::mounts() {
             let uuid = mount.volume.as_ref().map(|v| v.uuid.clone());
@@ -496,7 +439,6 @@ impl Inventory {
                 }
             };
             let mut index = None;
-            let mut source = None;
             if let (Marking::Valid(sentinel), Some(volume)) = (&marking, &mount.volume) {
                 let drive = Drive {
                     root: mount.path.clone(),
@@ -512,7 +454,6 @@ impl Inventory {
                                 generations.len(),
                                 library.contains_key(&volume.uuid),
                             ));
-                            source = Some(path.clone());
                             break;
                         }
                         Ok(_) => warnings.push(format!("{name}: {path:?} indexes another volume")),
@@ -535,7 +476,6 @@ impl Inventory {
                 index,
                 relation: Relation::None,
             });
-            sources.push(source);
         }
 
         // Drives in a drawer: their newest saved index stands in for them.
@@ -545,7 +485,7 @@ impl Inventory {
             .filter(|(uuid, _)| !mounted.contains(uuid))
             .collect();
         offline.sort_by(|a, b| a.1.1.header.volume.name.cmp(&b.1.1.header.volume.name));
-        for (uuid, (path, summary)) in offline {
+        for (uuid, (_path, summary)) in offline {
             rows.push(Row {
                 name: summary.header.volume.name.clone(),
                 path: None,
@@ -559,7 +499,6 @@ impl Inventory {
                 index: Some(stats(&summary, 0, true)),
                 relation: Relation::None,
             });
-            sources.push(Some(path));
         }
 
         // Who mirrors whom needs no entries, so it is known before the thread
@@ -597,23 +536,25 @@ impl Inventory {
         }
 
         let (sender, receiver) = mpsc::channel();
-        let snapshot = rows.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(Details::compute(&snapshot, &sources, &by_uuid));
+        // Entry tables are opened only by explicit search/compare/check commands.
+        let _ = sender.send(Details {
+            bytes: rows
+                .iter()
+                .map(|r| r.index.as_ref().and_then(|i| i.bytes))
+                .collect(),
+            comparisons: (0..rows.len()).map(|_| None).collect(),
+            warnings: Vec::new(),
         });
         let inventory = Self {
             rows,
-            catalog: Catalog::new(),
             loaded_unix: now,
             warnings,
         };
         (inventory, receiver)
     }
 
-    /// Fold in what the background thread parsed: the catalog, the byte
-    /// totals older footers lack, and every backup's comparison.
+    /// Fold in optional detail updates. Initial loading supplies summaries only.
     pub fn absorb(&mut self, details: Details) {
-        self.catalog = details.catalog;
         self.warnings.extend(details.warnings);
         for (row, bytes) in self.rows.iter_mut().zip(details.bytes) {
             if let (Some(index), Some(bytes)) = (&mut row.index, bytes) {
@@ -685,81 +626,13 @@ pub struct Comparison {
     pub estimate: Option<SyncEstimate>,
 }
 
-/// What only the full indexes can tell. Produced off-thread by `Inventory::start`,
-/// folded into the rows by `Inventory::absorb`. Vectors are indexed like `rows`.
+/// Optional detail updates, indexed like `rows`. Initial loading does not
+/// compute historical comparisons or read file inventories.
 pub struct Details {
-    pub catalog: Catalog,
     /// Byte total per row, for footers written before it was recorded there.
     pub bytes: Vec<Option<u64>>,
     pub comparisons: Vec<Option<Comparison>>,
     pub warnings: Vec<String>,
-}
-
-impl Details {
-    fn compute(
-        rows: &[Row],
-        sources: &[Option<PathBuf>],
-        by_uuid: &HashMap<String, usize>,
-    ) -> Self {
-        let mut warnings = Vec::new();
-        let manifests: Vec<Option<Manifest>> = sources
-            .iter()
-            .zip(rows)
-            .map(|(path, row)| {
-                let path = path.as_ref()?;
-                match Manifest::load(path) {
-                    Ok(manifest) => Some(manifest),
-                    Err(error) => {
-                        warnings.push(format!("{}: damaged index {path:?}: {error:#}", row.name));
-                        None
-                    }
-                }
-            })
-            .collect();
-        let bytes = manifests
-            .iter()
-            .map(|m| m.as_ref().map(|m| manifest::total_bytes(&m.entries)))
-            .collect();
-        let comparisons =
-            rows.iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    if row.role() != Some(Role::Backup) {
-                        return None;
-                    }
-                    let source = row
-                        .source_uuid()
-                        .and_then(|uuid| by_uuid.get(uuid).copied())?;
-                    let (source, backup) = (manifests[source].as_ref()?, manifests[i].as_ref()?);
-                    let estimate = row.sentinel().and_then(|sentinel| {
-                        match SyncEstimate::from_indexes(source, backup, sentinel.extras) {
-                            Ok(estimate) => Some(estimate),
-                            Err(error) => {
-                                warnings
-                                    .push(format!("{}: cannot estimate sync: {error:#}", row.name));
-                                None
-                            }
-                        }
-                    });
-                    Some(Comparison {
-                        behind: behind(source, backup),
-                        estimate,
-                    })
-                })
-                .collect();
-        let mut catalog = Catalog::new();
-        for (i, manifest) in manifests.iter().enumerate() {
-            if let Some(manifest) = manifest {
-                catalog.add(i, manifest);
-            }
-        }
-        Self {
-            catalog,
-            bytes,
-            comparisons,
-            warnings,
-        }
-    }
 }
 
 fn stats(summary: &Summary, generations: usize, saved_locally: bool) -> IndexStats {
@@ -787,7 +660,9 @@ fn library_summaries(warnings: &mut Vec<String>) -> HashMap<String, (PathBuf, Su
     let Ok(directory) = drive::library() else {
         return newest;
     };
-    for path in drive::listing(&directory, |name| name.ends_with(".jsonl")) {
+    for path in drive::listing(&directory, |name| {
+        crate::manifest::is_index(Path::new(name))
+    }) {
         match Manifest::summary(&path) {
             Ok(summary) => {
                 let uuid = summary.header.volume.uuid.clone();

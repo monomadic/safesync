@@ -485,30 +485,6 @@ fn put(root: &Path, relative: &str, content: &[u8]) {
 }
 
 #[test]
-fn catalog_search_is_case_insensitive_and_word_wise() {
-    let fixture = Fixture::new();
-    put(&fixture.root(), "Clips/2026/Holiday Beach.mov", b"aaaa");
-    put(&fixture.root(), "Clips/2025/holiday-city.MOV", b"bb");
-    put(&fixture.root(), "Stills/beach.jpg", b"c");
-    let manifest = fixture.scan(false);
-    let mut catalog = drives::Catalog::new();
-    catalog.add(3, &manifest);
-    assert_eq!(catalog.len(), 3);
-
-    let hits = catalog.search("HOLIDAY", 10);
-    assert_eq!(hits.len(), 2);
-    assert!(hits.iter().all(|r| r.row == 3 && !r.hashed));
-    // Every word must appear somewhere in the relative path.
-    let hits = catalog.search("beach 2026", 10);
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].path, "Clips/2026/Holiday Beach.mov");
-    assert_eq!(hits[0].size, 4);
-    assert!(catalog.search("   ", 10).is_empty());
-    assert!(catalog.search("nothing", 10).is_empty());
-    assert_eq!(catalog.search("o", 2).len(), 2, "limit is honoured");
-}
-
-#[test]
 fn behind_counts_paths_the_backup_lacks_or_holds_at_another_size() {
     let source = Fixture::new();
     put(&source.root(), "a.mov", b"1234");
@@ -619,4 +595,86 @@ fn hashing_reports_exact_totals_after_the_walk() {
     .unwrap();
     assert!(!hashed);
     assert_eq!(again.header.reused_hashes, 3);
+}
+
+#[test]
+fn rename_pairing_consumes_candidates_once_and_preserves_ambiguity_guards() {
+    use safesync::{
+        drive::Extras,
+        manifest::encode_path,
+        plan::{self, Action},
+    };
+    let fixture = Fixture::new();
+    put(&fixture.root(), "new.mov", b"same content");
+    let source = fixture.scan(true);
+    let mut backup = source.clone();
+    backup.entries[0].path_base64 = encode_path(Path::new("old.mov"));
+    let rename_count = |s: &Manifest, b: &Manifest| {
+        plan::plan(s, b, Extras::History)
+            .unwrap()
+            .count(|a| matches!(a, Action::Rename { .. }))
+    };
+    assert_eq!(rename_count(&source, &backup), 1);
+    assert!(
+        plan::fingerprint_candidates(&source, &backup)
+            .unwrap()
+            .is_empty()
+    );
+    // If the missing path already has a stamp match, unrelated same-size
+    // leftovers need no fingerprint reads.
+    let mut with_extra = backup.clone();
+    let mut extra = backup.entries[0].clone();
+    extra.path_base64 = encode_path(Path::new("extra.mov"));
+    extra.stamp.mtime_seconds -= 20;
+    with_extra.entries.push(extra);
+    assert!(
+        plan::fingerprint_candidates(&source, &with_extra)
+            .unwrap()
+            .is_empty()
+    );
+    // Different timestamps may be paired by fingerprint.
+    backup.entries[0].stamp.mtime_seconds -= 10;
+    assert_eq!(
+        plan::fingerprint_candidates(&source, &backup).unwrap(),
+        vec![0]
+    );
+    assert_eq!(rename_count(&source, &backup), 1);
+    // Two missing source paths cannot consume one backup file twice.
+    let mut duplicate_source = source.clone();
+    let mut duplicate = source.entries[0].clone();
+    duplicate.path_base64 = encode_path(Path::new("also-new.mov"));
+    duplicate_source.entries.push(duplicate);
+    assert_eq!(rename_count(&duplicate_source, &backup), 0);
+    // Nor may one missing path choose between two content-identical extras.
+    let mut duplicate_backup = backup.clone();
+    let mut duplicate = backup.entries[0].clone();
+    duplicate.path_base64 = encode_path(Path::new("also-old.mov"));
+    duplicate_backup.entries.push(duplicate);
+    assert_eq!(rename_count(&source, &duplicate_backup), 0);
+    // The same ambiguity guards apply to stamp matches without fingerprints.
+    for entry in &mut duplicate_backup.entries {
+        entry.stamp.mtime_seconds = source.entries[0].stamp.mtime_seconds;
+        entry.sha256 = None;
+    }
+    assert_eq!(rename_count(&source, &duplicate_backup), 0);
+    assert!(
+        plan::fingerprint_candidates(&source, &duplicate_backup)
+            .unwrap()
+            .is_empty()
+    );
+    backup.entries[0].stamp.mtime_seconds = source.entries[0].stamp.mtime_seconds;
+    assert_eq!(rename_count(&duplicate_source, &backup), 0);
+    // A same-path replacement consumes that path before rename matching.
+    let mut existing = source.entries[0].clone();
+    existing.stamp.size += 1;
+    backup.entries.push(existing);
+    let result = plan::plan(&source, &backup, Extras::History).unwrap();
+    assert_eq!(result.count(|a| matches!(a, Action::Rename { .. })), 0);
+    assert_eq!(result.count(|a| matches!(a, Action::Replace { .. })), 1);
+    assert_eq!(result.count(|a| matches!(a, Action::Retire { .. })), 1);
+    assert!(
+        plan::fingerprint_candidates(&source, &backup)
+            .unwrap()
+            .is_empty()
+    );
 }

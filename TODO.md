@@ -11,10 +11,12 @@ index, with a copy saved on this Mac for offline search. Backups and scratch
 drives keep their role sentinels and no file index. A local copy of a source
 index is a catalog of the source, not evidence of a second copy of its files.
 
-Why both sides are indexed today: the engine plans from two manifests, and the
-backup manifest was the cheapest way to feed it. Nothing else needs it.
+Implemented: sync publishes source indexes only and feeds the planner a transient
+metadata walk of the backup. Explicit scans are source-only. Fill uses source
+catalogs with optional live backup readers; legacy inventories remain readable
+until the explicit migration below.
 
-- [ ] Sync = refresh the source index (reuse unchanged fingerprints), then walk
+- [x] Sync = refresh the source index (reuse unchanged fingerprints), then walk
       the backup live and answer, per file, "is this on the source?":
       same path, same size+mtime → unchanged; same path, different stamp →
       replace. After resolving same-path matches, pair backup-only files with
@@ -40,18 +42,19 @@ backup manifest was the cheapest way to feed it. Nothing else needs it.
       per-file failures and stop scheduling after the first. Completed files
       stay, the run reports incomplete, and a rerun plans the remainder from a
       fresh walk. Never prune history automatically to make room.
-- [ ] Rename candidates with no stamp match may be hashed live. Only the backup
+- [x] Rename candidates with no stamp match may be hashed live. Only the backup
       file is read (the source fingerprint is in its index), and only for files
       that match nothing by size+mtime, so it is normally zero files. Show
       progress when a check starts reading files.
-- [ ] Exclusions: the source is king. Its sentinel's `exclude` list defines the
+- [x] Exclusions: the source is king. Its sentinel's `exclude` list defines the
       catalog; backups have no exclude list, they take what the source gives them.
       The backup walk applies the source's list plus the built-in system folders
       (`.Spotlight-V100`, `.fseventsd`, `.Trashes`, ...), which every volume grows
       on its own and which must never look like extras. Drop `exclude` from
-      backup and scratch sentinels and from the `sync` command. Today the
-      merged list is applied to the source scan and that result is published,
-      so a backup exclusion silently shrinks the source's saved index.
+      backup and scratch sentinels and from the `sync` command. Legacy
+      backup/scratch exclusion fields are accepted but ignored; their sentinel
+      files are not rewritten. Backup exclusions can no longer shrink the
+      source's saved index.
 - [ ] Guided setup: choose the originals drive, choose its backup, show the
       direction, then **Save and check backup**. The index refresh and the
       backup walk happen inside that flow; no per-disk indexing chore.
@@ -72,9 +75,7 @@ backup manifest was the cheapest way to feed it. Nothing else needs it.
       requiring manual indexing first.
 - [ ] First real run: works on today's engine. Set up Tower as source and Tower
       Backup as its backup, **Check / sync**, compare the plan with
-      `rclone-tower-safe --dry-run` before confirming. Known caveat until the
-      exclusion fix lands: the published source index is narrowed by the
-      backup's exclusions.
+      `rclone-tower-safe --dry-run` before confirming.
 
 ## Other work
 
@@ -120,7 +121,7 @@ query engine buys nothing, and a mmap'd immutable file keeps the
 hard-link-publish / footer-digest model unchanged. Revisit only if a reader
 appears that needs an ad-hoc query.
 
-- [ ] **Format** — `ROOT/.safesync/index-GENERATION.ssi`, one immutable file
+- [x] **Format** — `ROOT/.safesync/index-GENERATION.ssi`, one immutable file
       per source generation, plus its local offline-search copy. No backup or scratch
       index writer. Little-endian, every region 8-byte aligned, read via mmap.
       Layout, in file order:
@@ -157,7 +158,7 @@ appears that needs an ad-hoc query.
       happens at write time and again on read, as `validate` does now;
       sortedness is checked on read with one linear pass the first time the
       records are touched, not on `summary`.
-- [ ] **Readers** — `Manifest::summary` reads the header and committed trailer
+- [x] **Readers** — `Manifest::summary` reads the header and committed trailer
       (`files`, `bytes`, dates: what the source row shows). Validate the format version,
       header length, region bounds/alignment/non-overlap and expected lengths using
       checked arithmetic, and require the complete trailer at the expected file end.
@@ -174,7 +175,7 @@ appears that needs an ad-hoc query.
       `lookup --name` is a binary search on the heap for an exact basename
       only if we sort a second key; otherwise it is a substring scan of the
       heap, which is ~30 ms for Tower and fine.
-- [ ] **`safesync paths [DRIVE|INDEX ...]`** — writes one full absolute path followed
+- [x] **`safesync paths [DRIVE|INDEX ...]`** — writes one full absolute path followed
       by NUL for every entry of the named source indexes, or the newest saved index per source UUID
       when none is named; do not duplicate results for generations or local copies.
       Use the current source mount point identified by UUID when mounted, otherwise
@@ -195,8 +196,12 @@ appears that needs an ad-hoc query.
       noise; a quoted term still toggles per fzf's rules. Prefer naming drives:
       the whole library is several million lines and ~1 GB inside fzf.
       Drop the `Catalog` type and the in-memory lowercase copy with it.
-- [ ] **Migration** — implement source-only ownership before switching the source
-      writer to `.ssi`. Keep the JSONL reader until source indexes and their local
+- [ ] **Migration** — source-only ownership, `.ssi` publication, dual-format
+      readers and `safesync migrate [DRIVE|INDEX ...]` conversion are implemented.
+      Conversion includes matching mounted/local copies and retains JSONL originals.
+      Still pending: retirement of legacy backup/scratch inventories into volume
+      records, and the remaining behavioral coverage below.
+      Keep the JSONL reader until source indexes and their local
       search copies have been migrated; do not require rescanning backups or scratch
       drives. `info`, `compare`, `lookup` read both formats meanwhile, with legacy
       backup/scratch catalogs identified as historical and excluded from normal
@@ -216,7 +221,7 @@ appears that needs an ad-hoc query.
       trailers, header/string-heap corruption, invalid region bounds,
       raw tab/newline/non-UTF-8 paths, changed mount
       points, offline roots and exactly one NUL after each exported full path.
-- [ ] **Library pruning** — already keeps the newest 3 generations per volume UUID
+- [x] **Library pruning** — keeps the newest 3 generations per volume UUID across both formats
       (`KEPT_GENERATIONS` in `drive.rs`). Once backups stop publishing, their old
       copies in `~/Library/Application Support/safesync/manifests/` are retired by
       the migration step above, not by pruning.

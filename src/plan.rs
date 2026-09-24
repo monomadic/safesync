@@ -1,11 +1,12 @@
-//! What a one-way sync would do, worked out from two indexes alone.
+//! Plan from a source catalog and a transient live backup observation.
 use crate::{
     drive::Extras,
+    filesystem::Stamp,
     manifest::{Entry, Manifest},
 };
 use anyhow::Result;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -83,6 +84,54 @@ pub fn same_content(a: &Entry, b: &Entry) -> bool {
     }
 }
 
+pub fn same_stamp(a: &Stamp, b: &Stamp) -> bool {
+    (a.size, a.mtime_seconds, a.mtime_nanos) == (b.size, b.mtime_seconds, b.mtime_nanos)
+}
+
+/// Backup-only files with no stamp match among missing source paths, and a
+/// size for which the source has a fingerprint. No other backup files need reading.
+pub fn fingerprint_candidates(source: &Manifest, backup: &Manifest) -> Result<Vec<usize>> {
+    let source_paths = source
+        .entries
+        .iter()
+        .map(Entry::path)
+        .collect::<Result<HashSet<_>>>()?;
+    let backup_paths = backup
+        .entries
+        .iter()
+        .map(Entry::path)
+        .collect::<Result<HashSet<_>>>()?;
+    let mut leftover_stamps = HashSet::new();
+    for entry in &backup.entries {
+        if !source_paths.contains(&entry.path()?) {
+            leftover_stamps.insert(identity(entry));
+        }
+    }
+    let mut stamps = HashSet::new();
+    let mut sizes = HashSet::new();
+    for entry in &source.entries {
+        if !backup_paths.contains(&entry.path()?) {
+            stamps.insert(identity(entry));
+            if entry.sha256.is_some()
+                && entry.stamp.size > 0
+                && !leftover_stamps.contains(&identity(entry))
+            {
+                sizes.insert(entry.stamp.size);
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    for (index, entry) in backup.entries.iter().enumerate() {
+        if !source_paths.contains(&entry.path()?)
+            && !stamps.contains(&identity(entry))
+            && sizes.contains(&entry.stamp.size)
+        {
+            candidates.push(index);
+        }
+    }
+    Ok(candidates)
+}
+
 // What a moved file is recognised by. A multi-gigabyte video sharing both its
 // size and its nanosecond mtime with a different video does not happen.
 type Identity = (u64, i64, i64);
@@ -126,6 +175,7 @@ pub fn plan(source: &Manifest, backup: &Manifest, extras: Extras) -> Result<Plan
     for (_, entry) in &missing {
         *wanted.entry(identity(entry)).or_default() += 1;
     }
+    let mut unresolved = Vec::new();
     for (path, entry) in missing {
         let key = identity(entry);
         let size = entry.stamp.size;
@@ -144,8 +194,51 @@ pub fn plan(source: &Manifest, backup: &Manifest, extras: Extras) -> Result<Plan
                     size,
                 });
             }
-            _ => plan.actions.push(Action::Copy { path, size }),
+            _ => unresolved.push((path, entry)),
         }
+    }
+
+    // A second pass pairs content across different timestamps. Keep stamp
+    // ambiguities as copies: hashing must not silently weaken the first pass.
+    let mut by_hash: HashMap<(u64, &str), Vec<PathBuf>> = HashMap::new();
+    for (path, entry) in &there {
+        if !wanted.contains_key(&identity(entry))
+            && let Some(hash) = entry.sha256.as_deref()
+        {
+            by_hash
+                .entry((entry.stamp.size, hash))
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let mut wanted_hash: HashMap<(u64, &str), usize> = HashMap::new();
+    for (_, entry) in &unresolved {
+        if let Some(hash) = entry.sha256.as_deref() {
+            *wanted_hash.entry((entry.stamp.size, hash)).or_default() += 1;
+        }
+    }
+    for (path, entry) in unresolved {
+        let size = entry.stamp.size;
+        let from = entry.sha256.as_deref().and_then(|hash| {
+            let key = (size, hash);
+            let paths = by_hash.get(&key)?;
+            (size > 0
+                && !leftovers.contains_key(&identity(entry))
+                && paths.len() == 1
+                && wanted_hash[&key] == 1)
+                .then(|| paths[0].clone())
+        });
+        if let Some(from) = from
+            && there.remove(&from).is_some()
+        {
+            plan.actions.push(Action::Rename {
+                from,
+                to: path,
+                size,
+            });
+            continue;
+        }
+        plan.actions.push(Action::Copy { path, size });
     }
 
     for (path, entry) in there {

@@ -129,7 +129,6 @@ pub struct SyncOptions {
     pub hashing: Hashing,
     pub rehash: bool,
     pub verify: bool,
-    pub exclude: Vec<PathBuf>,
 }
 
 pub struct FillOptions {
@@ -152,24 +151,32 @@ pub fn scan_drive(
     index: usize,
     hashing: Hashing,
     rehash: bool,
-    extra_excludes: &[PathBuf],
+    exclusions: &[PathBuf],
     control: &Control,
 ) -> Result<Manifest> {
-    let cache = if rehash {
+    let is_source = drive.sentinel.role == Role::Source;
+    let cache = if rehash || !is_source {
         scan::HashCache::new(&drive.volume)
     } else {
         drive.hash_cache()?
     };
-    let mut exclude = drive.sentinel.exclude.clone();
-    exclude.extend_from_slice(extra_excludes);
-    let expected = drive.index_quiet().map(|m| m.entries.len());
+    let expected = if is_source {
+        drive.generations().iter().rev().find_map(|path| {
+            Manifest::summary(path)
+                .ok()
+                .filter(|s| s.header.volume.uuid == drive.volume.uuid)
+                .map(|s| s.files)
+        })
+    } else {
+        None
+    };
     let events = control.events.clone();
     let mut last = Instant::now();
     scan::scan_with_reuse(
         &drive.root,
         drive.volume.clone(),
         hashing,
-        &exclude,
+        exclusions,
         Some(&cache),
         |p| {
             if last.elapsed().as_millis() >= 100 {
@@ -199,11 +206,12 @@ fn scanned(control: &Control, drive: usize, manifest: &Manifest) {
     });
 }
 
-// Indexes are edited in memory as files land, so a sync ends with a current
-// index on both drives without walking either of them again.
+// Transient observations are edited as files land. Only the source observation
+// is published; the backup is always walked again on the next check.
 struct Index {
     manifest: Manifest,
     entries: BTreeMap<PathBuf, Entry>,
+    learned_hashes: bool,
 }
 impl Index {
     fn new(mut manifest: Manifest) -> Result<Self> {
@@ -211,7 +219,11 @@ impl Index {
         for entry in manifest.entries.drain(..) {
             entries.insert(entry.path()?, entry);
         }
-        Ok(Self { manifest, entries })
+        Ok(Self {
+            manifest,
+            entries,
+            learned_hashes: false,
+        })
     }
     fn finish(mut self) -> Manifest {
         self.manifest.entries = self.entries.into_values().collect();
@@ -230,6 +242,10 @@ impl Index {
 pub fn index_drive(root: PathBuf, hashing: Hashing, rehash: bool, control: Control) {
     let result = (|| -> Result<()> {
         let drive = Drive::open(&root)?;
+        ensure!(
+            drive.sentinel.role == Role::Source,
+            "Only source drives have indexes; use sync to check a backup"
+        );
         control.send(Event::Drives {
             sources: vec![drive.sentinel.name.clone()],
             destination: "index".into(),
@@ -237,7 +253,7 @@ pub fn index_drive(root: PathBuf, hashing: Hashing, rehash: bool, control: Contr
         });
         control.send(Event::Phase(Phase::Scanning));
         let started = Instant::now();
-        let mut manifest = scan_drive(&drive, 0, hashing, rehash, &[], &control)?;
+        let mut manifest = scan_drive(&drive, 0, hashing, rehash, &drive.exclusions(), &control)?;
         scanned(&control, 0, &manifest);
         control.send(Event::Phase(Phase::Indexing));
         let path = drive.publish(&mut manifest)?;
@@ -278,22 +294,11 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
         destination_path: backup.root.clone(),
     });
     control.send(Event::Phase(Phase::Scanning));
-    // Both drives must agree on what is out of scope, or the backup's copy of
-    // an excluded folder would look like an extra.
-    let mut exclude = options.exclude.clone();
-    exclude.extend(source.sentinel.exclude.iter().cloned());
-    exclude.extend(backup.sentinel.exclude.iter().cloned());
+    // The source owns the scope. A backup is metadata-only, with no saved
+    // fingerprint cache and no index publication, even when --hash is requested.
+    let exclude = source.exclusions();
     let (source_manifest, backup_manifest) = std::thread::scope(|scope| {
-        let theirs = scope.spawn(|| {
-            scan_drive(
-                &backup,
-                1,
-                options.hashing,
-                options.rehash,
-                &exclude,
-                control,
-            )
-        });
+        let theirs = scope.spawn(|| scan_drive(&backup, 1, Hashing::None, true, &exclude, control));
         let ours = scan_drive(
             &source,
             0,
@@ -304,9 +309,18 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
         );
         (ours, theirs.join().expect("scan thread panicked"))
     });
-    let (source_manifest, backup_manifest) = (source_manifest?, backup_manifest?);
+    let mut source_manifest = source_manifest?;
     scanned(control, 0, &source_manifest);
+    // A check refreshes the catalog even if the user declines the transfer.
+    source.publish(&mut source_manifest)?;
+    let mut backup_manifest = backup_manifest?;
     scanned(control, 1, &backup_manifest);
+    fingerprint_rename_candidates(
+        &source_manifest,
+        &mut backup_manifest,
+        &backup_root,
+        control,
+    )?;
 
     let plan = plan::plan(&source_manifest, &backup_manifest, backup.sentinel.extras)?;
     let (free, _) = copy::space(&backup.root)?;
@@ -416,10 +430,71 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
     }
 
     control.send(Event::Phase(Phase::Indexing));
-    source.publish(&mut source_index.finish())?;
-    backup.publish(&mut backup_index.finish())?;
+    if source_index.learned_hashes {
+        source.publish(&mut source_index.finish())?;
+    }
     summary.seconds = started.elapsed().as_secs_f64();
     control.send(Event::Done(summary));
+    Ok(())
+}
+
+fn fingerprint_rename_candidates(
+    source: &Manifest,
+    backup: &mut Manifest,
+    root: &Root,
+    control: &Control,
+) -> Result<()> {
+    let candidates = plan::fingerprint_candidates(source, backup)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut progress = scan::HashProgress {
+        files_total: candidates.len(),
+        bytes_total: candidates
+            .iter()
+            .map(|&i| backup.entries[i].stamp.size)
+            .sum(),
+        ..scan::HashProgress::default()
+    };
+    let files = backup.entries.len();
+    let bytes = backup.entries.iter().map(|e| e.stamp.size).sum();
+    let report = |hashing| {
+        control.send(Event::Scan {
+            drive: 1,
+            files,
+            bytes,
+            reused: 0,
+            expected: None,
+            hashing: Some(hashing),
+        })
+    };
+    control.send(Event::Log(
+        "Reading backup rename candidates for fingerprints".into(),
+    ));
+    report(progress);
+    let mut last = Instant::now();
+    for index in candidates {
+        ensure!(
+            !control.cancelled(),
+            "Cancelled while checking rename candidates"
+        );
+        let entry = &mut backup.entries[index];
+        let path = entry.path()?;
+        let mut file = checked_file(root, &path, entry)?;
+        entry.sha256 = Some(crate::filesystem::hash_file_with(
+            &mut file,
+            &entry.stamp,
+            |n| {
+                progress.bytes_done += n;
+                if last.elapsed().as_millis() >= 100 {
+                    report(progress);
+                    last = Instant::now();
+                }
+            },
+        )?);
+        progress.files_done += 1;
+        report(progress);
+    }
     Ok(())
 }
 
@@ -484,7 +559,14 @@ fn apply(
             // Never associate an old fingerprint with changed content metadata.
             let after = Stamp::of(&target.open()?.metadata()?);
             let unchanged = unchanged_by_move(&entry.stamp, &after);
-            entry.stamp = after;
+            // A fingerprint match may have a different mtime. Bring it into
+            // agreement so the next metadata walk sees an unchanged same-path pair.
+            if unchanged && !plan::same_stamp(&after, &expected_source.stamp) {
+                let moved = target.open()?;
+                moved.set_modified(source_file.metadata()?.modified()?)?;
+                moved.sync_all()?;
+            }
+            entry.stamp = Stamp::of(&target.open()?.metadata()?);
             if !unchanged {
                 entry.sha256 = None;
             }
@@ -554,6 +636,7 @@ fn apply(
                 }
             };
             if let Some(entry) = source_index.entries.get_mut(path) {
+                source_index.learned_hashes |= entry.sha256.as_ref() != Some(&sha256);
                 entry.sha256 = Some(sha256.clone());
             }
             backup_index.entries.insert(
@@ -598,6 +681,10 @@ fn run_fill(options: FillOptions, control: &Control) -> Result<()> {
         );
         drives.push(drive);
     }
+    ensure!(
+        drives.iter().any(|d| d.sentinel.role == Role::Source),
+        "fill needs a mounted source in --from; backup indexes are historical"
+    );
     // The source is the authority when the drives disagree about a path.
     drives.sort_by_key(|drive| drive.sentinel.role != Role::Source);
     fs::create_dir_all(&options.destination)?;
@@ -615,12 +702,16 @@ fn run_fill(options: FillOptions, control: &Control) -> Result<()> {
     });
     control.send(Event::Phase(Phase::Scanning));
 
-    // No walking: the indexes on the drives say what is where.
+    // Only source indexes define the selection. Other readers are checked live.
     let mut indexes = Vec::new();
     for (number, drive) in drives.iter().enumerate() {
-        let manifest = drive.index()?;
-        scanned(control, number, &manifest);
-        indexes.push(Index::new(manifest)?.entries);
+        if drive.sentinel.role == Role::Source {
+            let manifest = drive.index()?;
+            scanned(control, number, &manifest);
+            indexes.push(Index::new(manifest)?.entries);
+        } else {
+            indexes.push(BTreeMap::new());
+        }
     }
     let mut wanted = Vec::new();
     for selected in &options.select {
@@ -653,6 +744,28 @@ fn run_fill(options: FillOptions, control: &Control) -> Result<()> {
                         },
                     );
                 }
+            }
+        }
+    }
+    for (number, drive) in drives
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.sentinel.role == Role::Backup)
+    {
+        for job in jobs.values_mut() {
+            // A backup may assist only the source named by its live sentinel.
+            let owner = job.holders[0];
+            if drive.sentinel.source_uuid.as_deref() != Some(drives[owner].volume.uuid.as_str()) {
+                continue;
+            }
+            let current = source_roots[number]
+                .file(&job.path, false)
+                .and_then(|p| p.open())
+                .and_then(|f| Ok(Stamp::of(&f.metadata()?)));
+            if let Ok(stamp) = current
+                && plan::same_stamp(&job.entry.stamp, &stamp)
+            {
+                job.holders.push(number);
             }
         }
     }

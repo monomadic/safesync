@@ -95,7 +95,8 @@ impl HashCache {
         for entry in listing.flatten() {
             let path = entry.path();
             if entry.file_type().is_ok_and(|t| t.is_file())
-                && path.extension().is_some_and(|e| e == "jsonl")
+                && crate::manifest::is_index(&path)
+                && Manifest::summary(&path).is_ok_and(|s| s.header.volume.uuid == self.volume_uuid)
                 && let Ok(manifest) = Manifest::load(&path)
             {
                 self.add(&manifest);
@@ -311,6 +312,7 @@ pub fn scan_with_reuse(
             drive: None,
             root_base64: encode_path(&root),
             root_file_id: root_metadata.ino(),
+            device: Some(device),
             started_unix: started,
             finished_unix: now(),
             hash_algorithm: "sha256".into(),

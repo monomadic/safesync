@@ -119,7 +119,6 @@ fn sync(source: &Path, backup: &Path, approve: bool) -> Harness {
         hashing: Hashing::Known,
         rehash: false,
         verify: true,
-        exclude: vec![],
     };
     drive_work(move |c| engine::sync(options, c), approve)
 }
@@ -335,7 +334,7 @@ fn copy_never_overwrites_and_aborts_on_a_changed_source() {
 }
 
 #[test]
-fn sync_copies_renames_and_updates_both_indexes() {
+fn sync_copies_renames_and_publishes_only_source_indexes() {
     let _guard = HOME.lock().unwrap_or_else(|p| p.into_inner());
     let home = home();
     // SAFETY: tests holding HOME serialise on the mutex above.
@@ -352,6 +351,7 @@ fn sync_copies_renames_and_updates_both_indexes() {
     // Declined review copies nothing.
     let declined = sync(&a.root, &b.root, false);
     assert!(declined.summary().cancelled);
+    assert_eq!(source.index().unwrap().entries.len(), 3);
     assert!(!b.root.join("clips/one.mov").exists());
 
     let first = sync(&a.root, &b.root, true);
@@ -365,25 +365,18 @@ fn sync_copies_renames_and_updates_both_indexes() {
         b.root.join("leftover.mov").exists(),
         "extras are kept by default"
     );
-    let index = Drive::open(&b.root).unwrap().index().unwrap();
-    assert_eq!(index.entries.len(), 4);
-    let hashed = index.entries.iter().filter(|e| e.sha256.is_some()).count();
-    assert_eq!(
-        hashed, 3,
-        "every copied file has a fingerprint; the leftover was never read"
-    );
+    assert!(Drive::open(&b.root).unwrap().generations().is_empty());
     let sindex = Drive::open(&a.root).unwrap().index().unwrap();
     assert!(
         sindex.header.content_hashed,
         "the source learnt fingerprints from the copy"
     );
-    // Local copies for offline lookup exist for both drives.
-    assert_eq!(
-        fs::read_dir(home.join("Library/Application Support/safesync/manifests"))
-            .unwrap()
-            .count(),
-        2
-    );
+    // Declining review still refreshed the source catalog; every saved
+    // generation belongs to the source, never to the backup.
+    for entry in fs::read_dir(drive::library().unwrap()).unwrap() {
+        let saved = Manifest::load(&entry.unwrap().path()).unwrap();
+        assert_eq!(saved.header.volume.uuid, source.volume.uuid);
+    }
 
     // A rename on the source becomes a rename on the backup: no bytes copied.
     fs::rename(
@@ -429,6 +422,9 @@ fn fill_reads_from_both_drives_and_skips_what_is_there() {
     scan(&a.root);
     let synced = sync(&a.root, &b.root, true);
     assert_eq!(synced.summary().done, 3);
+    assert!(Drive::open(&b.root).unwrap().generations().is_empty());
+    write(&b.root, "set/backup-only.mov", b"not in source catalog");
+    write(&b.root, "set/x.mov", b"stale backup version");
     write(&c.root, "set/x.mov", &vec![1u8; 2 << 20]);
     let mtime = fs::metadata(a.root.join("set/x.mov"))
         .unwrap()
@@ -451,6 +447,11 @@ fn fill_reads_from_both_drives_and_skips_what_is_there() {
     assert!(c.root.join("dump/set/x.mov").exists());
     assert!(c.root.join("dump/set/y.mov").exists());
     assert!(!c.root.join("dump/other.mov").exists());
+    assert!(!c.root.join("dump/set/backup-only.mov").exists());
+    assert_eq!(
+        fs::read(c.root.join("dump/set/x.mov")).unwrap(),
+        vec![1u8; 2 << 20]
+    );
     let workers: std::collections::HashSet<_> = filled
         .events
         .iter()
@@ -507,7 +508,32 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
         .volume
         .uuid;
     scan(&a.root);
-    scan(&b.root);
+    let backup = Drive::open(&b.root).unwrap();
+    let mut legacy = safesync::scan::scan_with_exclusions(
+        &backup.root,
+        backup.volume.clone(),
+        false,
+        &source.exclusions(),
+        |_| {},
+    )
+    .unwrap();
+    legacy.header.drive = Some(safesync::manifest::RecordedDrive {
+        role: Role::Backup,
+        source_uuid: Some(source.volume.uuid.clone()),
+    });
+    legacy
+        .save_new(
+            &backup
+                .metadata_dir()
+                .join(format!("index-{}.jsonl", legacy.header.generation)),
+        )
+        .unwrap();
+    legacy
+        .export(&drive::library().unwrap().join(format!(
+            "legacy.{}.{}.jsonl",
+            backup.volume.uuid, legacy.header.generation
+        )))
+        .unwrap();
 
     let inventory = drives::Inventory::load();
     let row = |root: &Path| {
@@ -553,14 +579,11 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
         } => {
             assert_eq!(source_name.as_deref(), Some(src.name.as_str()));
             assert!(source_online);
-            assert_eq!(*behind, Some(2), "nothing has been synced yet");
+            assert_eq!(*behind, None, "saved catalogs are not live backup checks");
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        bak.state(inventory.loaded_unix).0,
-        "2 missing or size-changed files (saved indexes)"
-    );
+    assert_eq!(bak.state(inventory.loaded_unix).0, "check / sync with y");
 
     let plain = row(&c.root);
     assert!(matches!(plain.marking, Marking::Unmarked));
@@ -579,20 +602,6 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
         .position(|r| r.path.as_deref() == Some(c.root.as_path()))
         .unwrap();
     assert!(!inventory.sources().contains(&plain_row));
-
-    // The catalog covers every indexed file; search finds them by any part of the path.
-    let mine = |inventory: &drives::Inventory, query: &str| {
-        inventory
-            .catalog
-            .search(query, 100_000)
-            .into_iter()
-            .filter(|r| {
-                let uuid = inventory.rows[r.row].uuid.as_deref();
-                uuid == Some(source.volume.uuid.as_str()) || uuid == Some(backup_uuid.as_str())
-            })
-            .count()
-    };
-    assert_eq!(mine(&inventory, "clips/"), 2);
 
     // A copied sentinel is shown as refused, never as a role.
     fs::create_dir_all(c.root.join(".safesync")).unwrap();
@@ -625,14 +634,6 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
     assert_eq!(offline.role(), Some(Role::Source));
     assert!(offline.scan_refusal().is_some());
     assert_eq!(offline.index.as_ref().unwrap().files, 2);
-    // The backup was never synced, so only the ejected source's saved index holds the file.
-    assert_eq!(
-        mine(&inventory, "two.mov"),
-        1,
-        "an unplugged drive is still searchable"
-    );
-    let hit = inventory.catalog.search("clips/two.mov", 100_000);
-    assert!(hit.iter().any(|r| !inventory.rows[r.row].online()));
     let bak = inventory
         .rows
         .iter()
@@ -642,7 +643,7 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
         &bak.relation,
         Relation::Backup {
             source_online: false,
-            behind: Some(2),
+            behind: None,
             ..
         }
     ));
@@ -669,7 +670,7 @@ fn drives_inventory_lists_mounted_volumes_with_roles_and_index_state() {
     assert!(matches!(
         backup.relation,
         Relation::Backup {
-            behind: Some(2),
+            behind: None,
             source_online: false,
             ..
         }
@@ -684,7 +685,6 @@ fn review_sync(source: &Path, backup: &Path, mutate: impl FnOnce()) -> Harness {
         hashing: Hashing::Known,
         rehash: false,
         verify: true,
-        exclude: vec![],
     };
     let (events_tx, events_rx) = mpsc::channel();
     let (confirm_tx, confirm_rx) = mpsc::channel();
@@ -771,25 +771,16 @@ fn failed_replacement_restores_file_and_index_entry() {
     assert_eq!(result.failure(), None);
     assert_eq!(result.summary().failed, 1);
     assert_eq!(fs::read(b.root.join("clip.mov")).unwrap(), b"old");
-    let index = Drive::open(&b.root).unwrap().index().unwrap();
-    assert_eq!(index.entries.len(), 1);
-    assert_eq!(index.entries[0].path().unwrap(), Path::new("clip.mov"));
-    assert_eq!(
-        index.entries[0].stamp,
-        safesync::filesystem::Stamp::of(&fs::metadata(b.root.join("clip.mov")).unwrap())
-    );
-    // fill relies on the published index, so the restored old version remains usable.
-    let destination = home.join("restored");
+    assert!(Drive::open(&b.root).unwrap().generations().is_empty());
+    // A historical backup version cannot become the authority for fill.
     let options = FillOptions {
         from: vec![b.root.clone()],
-        destination: destination.clone(),
+        destination: home.join("restored"),
         select: vec![],
         verify: true,
     };
     let filled = drive_work(move |c| engine::fill(options, c), true);
-    assert_eq!(filled.failure(), None);
-    assert_eq!(filled.summary().done, 1);
-    assert_eq!(fs::read(destination.join("clip.mov")).unwrap(), b"old");
+    assert!(filled.failure().unwrap().contains("mounted source"));
     // A later successful replacement keeps the old bytes in history.
     let replaced = sync(&a.root, &b.root, true);
     assert_eq!(replaced.failure(), None);
@@ -830,7 +821,6 @@ fn rename_rejects_changes_during_review_without_poisoning_hash_cache() {
         .set_modified(mtime)
         .unwrap();
     scan(&a.root);
-    scan(&b.root);
     let result = review_sync(&a.root, &b.root, || write(&b.root, "old.mov", b"modified"));
     assert_eq!(result.failure(), None);
     assert_eq!(result.summary().failed, 1);
@@ -911,4 +901,177 @@ fn copy_and_cleanup_stay_anchored_when_parent_is_replaced() {
     }
     assert!(root.file(Path::new("../escape.bin"), true).is_err());
     fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn source_owns_exclusions_and_backup_never_publishes_or_uses_a_saved_index() {
+    let _guard = HOME.lock().unwrap_or_else(|p| p.into_inner());
+    let home = home();
+    unsafe { std::env::set_var("HOME", &home) };
+    let a = RamDisk::new("scope-src");
+    let b = RamDisk::new("scope-bak");
+    let mut source = Drive::init(&a.root, Role::Source, None).unwrap();
+    let mut backup = Drive::init(&b.root, Role::Backup, Some(&source)).unwrap();
+    let sentinel_path = backup.metadata_dir().join("drive.toml");
+    assert!(
+        !fs::read_to_string(&sentinel_path)
+            .unwrap()
+            .contains("exclude =")
+    );
+    source.sentinel.exclude = vec!["protected".into()];
+    fs::write(
+        source.metadata_dir().join("drive.toml"),
+        toml::to_string(&source.sentinel).unwrap(),
+    )
+    .unwrap();
+    backup.sentinel.exclude = vec!["included".into()]; // legacy, ignored
+    backup.sentinel.extras = Extras::History;
+    fs::write(&sentinel_path, toml::to_string(&backup.sentinel).unwrap()).unwrap();
+    write(&a.root, "included/clip.mov", b"source media");
+    write(&a.root, "protected/source.mov", b"not cataloged");
+    write(&b.root, "protected/backup.mov", b"must stay");
+    write(&b.root, ".rclone/cache", b"system data must stay");
+    write(&b.root, "extra.mov", b"extra");
+    // Even a corrupt historical backup index must not affect the check.
+    let legacy = backup.metadata_dir().join("index-legacy.jsonl");
+    fs::write(&legacy, b"historical index, untouched").unwrap();
+    let options = SyncOptions {
+        source: a.root.clone(),
+        backup: b.root.clone(),
+        hashing: Hashing::Missing,
+        rehash: true,
+        verify: true,
+    };
+    let result = drive_work(move |c| engine::sync(options, c), true);
+    assert_eq!(result.failure(), None);
+    assert_eq!(result.summary().failed, 0, "{:?}", result.errors());
+    assert_eq!(result.summary().done, 2); // copy plus retire
+    let index = source.index().unwrap();
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(
+        index.entries[0].path().unwrap(),
+        Path::new("included/clip.mov")
+    );
+    assert_eq!(
+        fs::read(b.root.join("included/clip.mov")).unwrap(),
+        b"source media"
+    );
+    assert_eq!(
+        fs::read(b.root.join("protected/backup.mov")).unwrap(),
+        b"must stay"
+    );
+    assert!(b.root.join(".rclone/cache").exists());
+    assert!(!b.root.join("extra.mov").exists());
+    assert_eq!(backup.generations(), vec![legacy.clone()]);
+    assert_eq!(fs::read(&legacy).unwrap(), b"historical index, untouched");
+    assert!(!result.events.iter().any(|e| matches!(
+        e,
+        Event::Scan {
+            drive: 1,
+            hashing: Some(_),
+            ..
+        }
+    )));
+    for entry in fs::read_dir(drive::library().unwrap()).unwrap() {
+        assert_eq!(
+            Manifest::load(&entry.unwrap().path())
+                .unwrap()
+                .header
+                .volume
+                .uuid,
+            source.volume.uuid
+        );
+    }
+    let root = b.root.clone();
+    let refused = drive_work(
+        move |c| engine::index_drive(root, Hashing::Missing, false, c),
+        true,
+    );
+    assert!(refused.failure().unwrap().contains("Only source drives"));
+    assert!(backup.publish(&mut index.clone()).is_err());
+    // A copied historical source header cannot authorize migration on a backup.
+    let copied_catalog = backup.metadata_dir().join("copied-source.jsonl");
+    index.export(&copied_catalog).unwrap();
+    assert!(safesync::paths::migrate(&[copied_catalog.clone()]).is_err());
+    assert!(!copied_catalog.with_extension("ssi").exists());
+    assert!(Drive::open(&b.root).unwrap().sentinel.exclude.is_empty());
+    // Scratch sentinels likewise omit exclusions and cannot publish indexes.
+    backup.sentinel.role = Role::Scratch;
+    backup.sentinel.source_uuid = None;
+    fs::write(&sentinel_path, toml::to_string(&backup.sentinel).unwrap()).unwrap();
+    let scratch = Drive::open(&b.root).unwrap();
+    assert!(scratch.sentinel.exclude.is_empty());
+    assert!(scratch.publish(&mut index.clone()).is_err());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn sync_hashes_only_unmatched_backup_candidates_and_reuses_the_rename_next_time() {
+    use std::{
+        os::unix::fs::MetadataExt,
+        time::{Duration, UNIX_EPOCH},
+    };
+    let _guard = HOME.lock().unwrap_or_else(|p| p.into_inner());
+    let home = home();
+    unsafe { std::env::set_var("HOME", &home) };
+    let a = RamDisk::new("hash-src");
+    let b = RamDisk::new("hash-bak");
+    let source = Drive::init(&a.root, Role::Source, None).unwrap();
+    let backup = Drive::init(&b.root, Role::Backup, Some(&source)).unwrap();
+    write(&a.root, "new.mov", b"same content");
+    write(&b.root, "old.mov", b"same content");
+    fs::File::open(b.root.join("old.mov"))
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1000))
+        .unwrap();
+    write(&b.root, "unrelated.mov", b"different size");
+    scan(&a.root);
+    let inode = fs::metadata(b.root.join("old.mov")).unwrap().ino();
+    let first = sync(&a.root, &b.root, true);
+    assert_eq!(first.failure(), None);
+    assert_eq!(first.summary().failed, 0, "{:?}", first.errors());
+    assert_eq!((first.summary().done, first.summary().bytes), (1, 0));
+    assert_eq!(fs::metadata(b.root.join("new.mov")).unwrap().ino(), inode);
+    let progress: Vec<_> = first
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Scan {
+                drive: 1,
+                hashing: Some(p),
+                ..
+            } => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress.first().unwrap().files_done, 0);
+    assert_eq!(progress.last().unwrap().files_done, 1);
+    assert_eq!(progress.last().unwrap().bytes_total, 12);
+    let second = sync(&a.root, &b.root, true);
+    assert_eq!(second.failure(), None);
+    assert_eq!(second.summary().done, 0);
+    assert!(!second.events.iter().any(|e| matches!(
+        e,
+        Event::Scan {
+            drive: 1,
+            hashing: Some(_),
+            ..
+        }
+    )));
+    assert!(backup.generations().is_empty());
+    // A source alone can fill a scratch folder; no backup index is required.
+    let options = FillOptions {
+        from: vec![a.root.clone()],
+        destination: home.join("fill"),
+        select: vec![],
+        verify: true,
+    };
+    let filled = drive_work(move |c| engine::fill(options, c), true);
+    assert_eq!(filled.failure(), None);
+    assert_eq!(filled.summary().done, 1);
+    assert_eq!(
+        fs::read(home.join("fill/new.mov")).unwrap(),
+        b"same content"
+    );
+    fs::remove_dir_all(home).unwrap();
 }

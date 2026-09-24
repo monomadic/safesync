@@ -58,8 +58,8 @@ pub struct Sentinel {
     /// Backup only: the one source this drive mirrors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_uuid: Option<String>,
-    /// Literal paths relative to the root, skipped by every scan.
-    #[serde(default)]
+    /// Source-only catalog exclusions. Legacy backup/scratch values are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<PathBuf>,
     #[serde(default)]
     pub extras: Extras,
@@ -82,8 +82,11 @@ impl Sentinel {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("Cannot read {path:?}")),
         };
-        let sentinel =
+        let mut sentinel: Self =
             toml::from_str(&text).with_context(|| format!("Invalid sentinel {path:?}"))?;
+        if sentinel.role != Role::Source {
+            sentinel.exclude.clear();
+        }
         Ok(Some(sentinel))
     }
 }
@@ -129,7 +132,7 @@ impl Drive {
             name: volume.name.clone(),
             volume_uuid: volume.uuid.clone(),
             source_uuid,
-            exclude: DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect(),
+            exclude: Vec::new(),
             extras: Extras::Keep,
         };
         fs::create_dir_all(&directory)?;
@@ -171,6 +174,17 @@ impl Drive {
         })
     }
 
+    /// System folders are always out of scope, even in older sentinels.
+    pub fn exclusions(&self) -> Vec<PathBuf> {
+        let mut exclusions: Vec<_> = DEFAULT_EXCLUDES.iter().map(PathBuf::from).collect();
+        if self.sentinel.role == Role::Source {
+            exclusions.extend(self.sentinel.exclude.iter().cloned());
+        }
+        exclusions.sort();
+        exclusions.dedup();
+        exclusions
+    }
+
     pub fn metadata_dir(&self) -> PathBuf {
         self.root.join(METADATA_DIR)
     }
@@ -178,11 +192,11 @@ impl Drive {
     /// Every index generation on the drive, oldest first.
     pub fn generations(&self) -> Vec<PathBuf> {
         listing(&self.metadata_dir(), |name| {
-            name.starts_with("index-") && name.ends_with(".jsonl")
+            name.starts_with("index-") && crate::manifest::is_index(Path::new(name))
         })
     }
 
-    /// The newest readable index on the drive: the source of truth for its contents.
+    /// The newest readable index: authoritative for sources, historical for other roles.
     pub fn index(&self) -> Result<Manifest> {
         for path in self.generations().iter().rev() {
             match Manifest::load(path) {
@@ -193,6 +207,11 @@ impl Drive {
                 Err(error) => eprintln!("safesync: ignoring damaged index {path:?}: {error:#}"),
             }
         }
+        ensure!(
+            self.sentinel.role == Role::Source,
+            "{:?} has no historical index; only source drives are indexed",
+            self.sentinel.name
+        );
         bail!(
             "{:?} has no index yet; run `safesync scan {:?}`",
             self.sentinel.name,
@@ -222,6 +241,10 @@ impl Drive {
     /// lookup, and drop generations beyond the last few in both places.
     pub fn publish(&self, manifest: &mut Manifest) -> Result<PathBuf> {
         ensure!(
+            self.sentinel.role == Role::Source,
+            "Only source drives may publish indexes"
+        );
+        ensure!(
             manifest.header.volume.uuid == self.volume.uuid,
             "Index belongs to another volume"
         );
@@ -230,9 +253,7 @@ impl Drive {
             source_uuid: self.sentinel.source_uuid.clone(),
         });
         let generation = &manifest.header.generation;
-        let path = self
-            .metadata_dir()
-            .join(format!("index-{generation}.jsonl"));
+        let path = self.metadata_dir().join(format!("index-{generation}.ssi"));
         manifest.save_new(&path)?;
         prune(self.generations());
 
@@ -251,8 +272,10 @@ impl Drive {
                 }
             })
             .collect();
-        manifest.export(&library.join(format!("{name}{tag}{generation}.jsonl")))?;
-        prune(listing(&library, |file| file.contains(&tag)));
+        manifest.export(&library.join(format!("{name}{tag}{generation}.ssi")))?;
+        prune(listing(&library, |file| {
+            file.contains(&tag) && crate::manifest::is_index(Path::new(file))
+        }));
         Ok(path)
     }
 }
@@ -267,21 +290,58 @@ pub fn listing(directory: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .filter(|entry| entry.file_name().to_str().is_some_and(&keep))
         .map(|entry| entry.path())
         .collect();
-    // A generation is NANOS-PID-SEQ, so its leading number orders files by age.
     paths.sort_by_key(|path| {
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-        stem.rsplitn(3, '-')
-            .nth(2)
-            .and_then(|rest| rest.rsplit(['-', '.']).next()?.parse::<u128>().ok())
-            .unwrap_or(0)
+        (
+            generation_key(path),
+            path.extension().is_some_and(|e| e == "ssi"),
+        )
     });
     paths
 }
 
+fn generation_key(path: &Path) -> (u128, u64, u64) {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let mut parts = stem.rsplitn(3, '-');
+    let seq = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let pid = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let nanos = parts
+        .next()
+        .and_then(|s| s.rsplit(['-', '.']).next()?.parse().ok())
+        .unwrap_or(0);
+    (nanos, pid, seq)
+}
+
 fn prune(generations: Vec<PathBuf>) {
-    let surplus = generations.len().saturating_sub(KEPT_GENERATIONS);
-    for path in &generations[..surplus] {
-        let _ = fs::remove_file(path);
+    let mut kept = std::collections::HashSet::new();
+    for path in generations.iter().rev() {
+        let key = generation_key(path);
+        if kept.contains(&key) || kept.len() < KEPT_GENERATIONS {
+            kept.insert(key);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retention_counts_generations_across_both_formats() {
+        let root = std::env::temp_dir().join(crate::manifest::generation());
+        fs::create_dir(&root).unwrap();
+        for n in 1..=5 {
+            for ext in ["jsonl", "ssi"] {
+                fs::write(root.join(format!("index-{n}-1-0.{ext}")), b"fixture").unwrap();
+            }
+        }
+        let files = listing(&root, |_| true);
+        assert!(files.last().unwrap().extension().unwrap() == "ssi");
+        prune(files);
+        let remaining = listing(&root, |_| true);
+        assert_eq!(remaining.len(), 6);
+        assert!(remaining.iter().all(|p| generation_key(p).0 >= 3));
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

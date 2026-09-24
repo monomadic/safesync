@@ -46,6 +46,8 @@ pub struct Header {
     pub drive: Option<RecordedDrive>,
     pub root_base64: String,
     pub root_file_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<u64>,
     pub started_unix: u64,
     pub finished_unix: u64,
     pub hash_algorithm: String,
@@ -128,7 +130,7 @@ pub fn decode_path(value: &str) -> Result<PathBuf> {
         STANDARD.decode(value)?,
     )))
 }
-fn validate(header: &Header, entries: &[Entry]) -> Result<()> {
+pub(crate) fn validate_header(header: &Header) -> Result<()> {
     ensure!(
         header.schema == SCHEMA,
         "Unsupported manifest schema {}",
@@ -143,24 +145,38 @@ fn validate(header: &Header, entries: &[Entry]) -> Result<()> {
         "Manifest has no volume identity"
     );
     ensure!(
-        decode_path(&header.root_base64)?.is_absolute(),
+        decode_path(&header.root_base64)?.is_absolute()
+            && !decode_path(&header.root_base64)?
+                .as_os_str()
+                .as_bytes()
+                .contains(&0),
         "Manifest root is not absolute"
     );
+    Ok(())
+}
+
+pub(crate) fn validate_path(path: &Path) -> Result<()> {
+    ensure!(
+        !path.as_os_str().is_empty()
+            && !path.as_os_str().as_bytes().contains(&0)
+            && path
+                .components()
+                .collect::<PathBuf>()
+                .as_os_str()
+                .as_bytes()
+                == path.as_os_str().as_bytes()
+            && path.components().all(|c| matches!(c, Component::Normal(_))),
+        "Unsafe manifest path"
+    );
+    Ok(())
+}
+
+fn validate(header: &Header, entries: &[Entry]) -> Result<()> {
+    validate_header(header)?;
     let mut paths = HashSet::new();
     for entry in entries {
         let path = entry.path()?;
-        ensure!(
-            !path.as_os_str().is_empty()
-                && !path.as_os_str().as_bytes().contains(&0)
-                && path
-                    .components()
-                    .collect::<PathBuf>()
-                    .as_os_str()
-                    .as_bytes()
-                    == path.as_os_str().as_bytes()
-                && path.components().all(|c| matches!(c, Component::Normal(_))),
-            "Unsafe manifest path"
-        );
+        validate_path(&path)?;
         ensure!(paths.insert(path), "Duplicate manifest path");
         if let Some(hash) = &entry.sha256 {
             ensure!(
@@ -186,7 +202,11 @@ impl Manifest {
 
     pub fn load(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("Cannot read manifest {:?}", path))?;
-        Self::read_from(file)
+        if binary_file(&file)? {
+            crate::binary::Index::from_file(file)?.to_manifest()
+        } else {
+            Self::read_from(file)
+        }
     }
 
     /// Header and footer only: O(1) in the number of entries, so the drives
@@ -196,6 +216,9 @@ impl Manifest {
     pub fn summary(path: &Path) -> Result<Summary> {
         let mut file =
             File::open(path).with_context(|| format!("Cannot read manifest {:?}", path))?;
+        if binary_file(&file)? {
+            return crate::binary::summary(file);
+        }
         let mut first = Vec::new();
         BufReader::new(&mut file)
             .take(EDGE_LINE)
@@ -319,7 +342,11 @@ impl Manifest {
             .open(&temp)?;
         let result = (|| -> Result<()> {
             let mut writer = BufWriter::new(file);
-            self.write_to(&mut writer)?;
+            if output.extension().is_some_and(|e| e == "ssi") {
+                crate::binary::write(self, &mut writer)?;
+            } else {
+                self.write_to(&mut writer)?;
+            }
             full_sync(writer.get_ref())?;
             fs::hard_link(&temp, output)
                 .context("Cannot publish manifest (existing outputs are never overwritten)")?;
@@ -372,4 +399,14 @@ pub(crate) fn full_sync(file: &File) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Both supported inventory formats, excluding temporary files and volume records.
+pub fn is_index(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "jsonl" || e == "ssi")
+}
+pub fn binary_file(file: &File) -> Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut magic = [0; 4];
+    Ok(file.read_at(&mut magic, 0)? == 4 && &magic == crate::binary::MAGIC)
 }

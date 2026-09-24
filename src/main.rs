@@ -47,7 +47,7 @@ enum Command {
     },
     /// Show a drive's sentinel and current index.
     Show { root: PathBuf },
-    /// Index a drive: publishes to ROOT/.safesync and keeps a copy on this Mac.
+    /// Index a source drive: publishes to ROOT/.safesync and keeps a copy on this Mac.
     Scan {
         root: PathBuf,
         /// Read every file that has no fingerprint yet (new or changed files only).
@@ -64,7 +64,7 @@ enum Command {
         /// Read back every copied file and compare fingerprints.
         #[arg(long)]
         verify: bool,
-        /// Fingerprint new files while scanning instead of trusting size and mtime.
+        /// Fingerprint new source files; backup checks use live size and mtime.
         #[arg(long)]
         hash: bool,
         #[arg(long, requires = "hash")]
@@ -72,9 +72,6 @@ enum Command {
         /// Skip the review screen.
         #[arg(long, short)]
         yes: bool,
-        /// Extra literal paths (relative to the roots) to leave out this time.
-        #[arg(long)]
-        exclude: Vec<PathBuf>,
     },
     /// Copy from one or more library drives onto a scratch disk, reading from
     /// each drive in parallel. Selection from arguments or NUL/newline-separated stdin.
@@ -93,6 +90,10 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
+    /// Stream full source paths, each followed by NUL (for fzf --read0 or xargs -0).
+    Paths { indexes: Vec<PathBuf> },
+    /// Convert selected source catalogs to binary without rescanning or deleting JSONL.
+    Migrate { indexes: Vec<PathBuf> },
     /// Search saved indexes while the drives are unplugged.
     Lookup {
         #[arg(long)]
@@ -129,7 +130,7 @@ fn saved_manifests() -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|e| e == "jsonl") {
+        if entry.file_type()?.is_file() && safesync::manifest::is_index(&entry.path()) {
             paths.push(entry.path());
         }
     }
@@ -147,9 +148,31 @@ fn drives(icons: bool) -> Result<i32> {
         return Ok(0);
     }
     let mut focus: Option<PathBuf> = None;
+    let mut hit = None;
+    let mut notice: Option<String> = None;
     loop {
-        match drives_ui::run(focus.as_deref(), icons)? {
+        match drives_ui::run(
+            focus.as_deref(),
+            icons,
+            hit.as_ref(),
+            notice.take().as_deref(),
+        )? {
             Action::Quit => return Ok(0),
+            Action::Search { source_uuid } => {
+                match safesync::paths::search(source_uuid.as_deref()) {
+                    Ok(Some(found)) => {
+                        hit = Some(found);
+                        focus = None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => notice = Some(format!("{error:#}")),
+                }
+            }
+            Action::Reveal { hit } => {
+                if let Err(error) = safesync::paths::reveal(&hit) {
+                    notice = Some(format!("{error:#}"));
+                }
+            }
             Action::Scan { root, hash } => {
                 focus = Some(root.clone());
                 let hashing = if hash {
@@ -169,7 +192,6 @@ fn drives(icons: bool) -> Result<i32> {
                     hashing: Hashing::Known,
                     rehash: false,
                     verify: false,
-                    exclude: Vec::new(),
                 };
                 ui::run("sync", false, move |control| engine::sync(options, control))?;
             }
@@ -192,7 +214,15 @@ fn run(cli: Cli) -> Result<i32> {
                 drive.sentinel.role,
                 safe_display(&drive.metadata_dir().join("drive.toml"))
             );
-            println!("Next: safesync scan {}", safe_display(&drive.root));
+            match role {
+                Role::Source => println!("Next: safesync scan {}", safe_display(&drive.root)),
+                Role::Backup => println!(
+                    "Next: safesync sync {} {}",
+                    safe_display(&source.as_ref().unwrap().root),
+                    safe_display(&drive.root)
+                ),
+                Role::Scratch => println!("Ready for safesync fill."),
+            }
         }
         Command::Show { root } => {
             let drive = Drive::open(&root)?;
@@ -229,7 +259,6 @@ fn run(cli: Cli) -> Result<i32> {
             hash,
             rehash,
             yes,
-            exclude,
         } => {
             let options = SyncOptions {
                 source,
@@ -241,7 +270,6 @@ fn run(cli: Cli) -> Result<i32> {
                 },
                 rehash,
                 verify,
-                exclude,
             };
             return ui::run("sync", yes, move |control| engine::sync(options, control));
         }
@@ -267,6 +295,24 @@ fn run(cli: Cli) -> Result<i32> {
             };
             return ui::run("fill", yes, move |control| engine::fill(options, control));
         }
+        Command::Paths { indexes } => {
+            let selected = safesync::paths::select(&indexes)?;
+            let result = safesync::paths::write(&selected, std::io::stdout().lock());
+            if result.as_ref().err().is_some_and(|e| {
+                e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+                })
+            }) {
+                return Ok(0);
+            }
+            result?;
+        }
+        Command::Migrate { indexes } => {
+            for path in safesync::paths::migrate(&indexes)? {
+                println!("{}", safe_display(&path));
+            }
+        }
         Command::Lookup {
             manifest,
             name,
@@ -274,7 +320,10 @@ fn run(cli: Cli) -> Result<i32> {
             json,
         } => {
             let paths = if manifest.is_empty() {
-                saved_manifests()?
+                safesync::paths::saved()?
+                    .into_iter()
+                    .map(|c| c.path)
+                    .collect()
             } else {
                 manifest
             };
@@ -282,15 +331,11 @@ fn run(cli: Cli) -> Result<i32> {
                 !paths.is_empty(),
                 "No saved indexes yet; scan a drive first."
             );
-            let inventories: Vec<_> = paths
-                .iter()
-                .map(|p| Manifest::load(p))
-                .collect::<Result<_>>()?;
             let query = match &name {
                 Some(name) => Query::Name(name),
                 None => Query::File(file.as_deref().context("Missing query")?),
             };
-            let report = lookup::lookup(&inventories, query)?;
+            let report = lookup::lookup_paths(&paths, query)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -329,18 +374,18 @@ fn run(cli: Cli) -> Result<i32> {
             }
         }
         Command::Info { manifest } => {
-            let inventory = Manifest::load(&manifest)?;
+            let inventory = Manifest::summary(&manifest)?;
             println!("{}", serde_json::to_string_pretty(&inventory.header)?);
-            println!("Files: {}", inventory.entries.len());
+            println!("Files: {}", inventory.files);
         }
         Command::Manifests => {
             for path in saved_manifests()? {
-                let inventory = Manifest::load(&path)?;
+                let inventory = Manifest::summary(&path)?;
                 println!(
                     "{}\n  {:?} · {} files · scanned at Unix {} · {}",
                     safe_display(&path),
                     inventory.header.volume.name,
-                    inventory.entries.len(),
+                    inventory.files,
                     inventory.header.finished_unix,
                     if inventory.header.content_hashed {
                         "fingerprinted"
