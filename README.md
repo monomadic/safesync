@@ -172,7 +172,8 @@ never uses a saved index or a fingerprint cache:
   source mtime, so subsequent checks recognize them by metadata.
 - **replace** — same path, different content. The backup's version goes to
   `.safesync/history/GENERATION/` first, never deleted.
-- **retire** — only with `extras = "history"`: backup-only files move to history.
+- **remove** — only with `extras = "history"`: backup-only files move to history
+  (`Kind::Retire` in the code). Directories are never removed, even once empty.
 
 The source is never written except for its own `.safesync/index`. Each file is
 copied uncached (`F_NOCACHE`), preallocated, read and written on separate

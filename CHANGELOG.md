@@ -6,6 +6,10 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ### Changed
 
+- The review and copy screens show the plan's stages — rename, remove,
+  replace, copy — with planned counts before confirmation and done/planned
+  counts while running, the current stage highlighted. Backup-only files
+  moved to history are labelled "remove" rather than "retire".
 - `paths` now writes one path per line by default, so it pipes straight into
   line-oriented tools; `--print0` restores NUL terminators for `fzf --read0`
   and `xargs -0`. The drives screen's `/` search still feeds fzf with NUL.
