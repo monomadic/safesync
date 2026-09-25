@@ -118,8 +118,40 @@ impl HashCache {
 }
 
 // No ignored errors, hidden-file rules, or incomplete manifest publication.
-// The only implicit scope exclusions are our metadata, Finder's .DS_Store
-// files, and non-regular objects.
+// The only implicit scope exclusions are our metadata, the operating
+// systems' own housekeeping files (`SYSTEM_NAMES`, AppleDouble `._*`
+// files), and non-regular objects.
+
+/// Names that are never media, wherever they appear: Finder and Windows
+/// folder metadata, and the per-volume service directories that a drive
+/// formatted elsewhere or copied through a non-APFS filesystem carries
+/// deep inside its tree, not only at its root.
+const SYSTEM_NAMES: &[&str] = &[
+    ".DS_Store",
+    ".localized",
+    ".apdisk",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".Trashes",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    "Thumbs.db",
+    "desktop.ini",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+];
+
+/// Housekeeping the scan leaves out by name: our own metadata directory,
+/// the system names above, and AppleDouble sidecars (`._name`, the resource
+/// fork and Finder info macOS writes beside a file on filesystems without
+/// native forks).
+fn housekeeping(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    name == ".safesync"
+        || bytes.starts_with(b"._")
+        || SYSTEM_NAMES.iter().any(|s| s.as_bytes() == bytes)
+}
 pub fn scan(
     root: &Path,
     volume: Volume,
@@ -210,8 +242,7 @@ pub fn scan_cancellable(
         for name in
             filesystem::names(&parent).with_context(|| format!("Cannot list {:?}", relative))?
         {
-            // Finder's per-folder metadata is noise on every drive, never media.
-            if name == ".safesync" || name == ".DS_Store" {
+            if housekeeping(&name) {
                 continue;
             }
             let child = relative.join(&name);
@@ -359,7 +390,8 @@ pub fn scan_cancellable(
                 && entries.iter().all(|entry| entry.sha256.is_some()),
             exclusions: vec![
                 "Any directory or file named .safesync".into(),
-                "Finder metadata files named .DS_Store".into(),
+                "AppleDouble ._* files and system names (.DS_Store, .Spotlight-V100, Thumbs.db, …)"
+                    .into(),
                 "Symlinks and special files".into(),
                 "Other mounted filesystems".into(),
             ]

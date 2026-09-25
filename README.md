@@ -114,7 +114,9 @@ safesync show /Volumes/Tower
 The source sentinel may contain `exclude = ["relative/folder", ...]`; these
 literal subtrees are left out of both the source catalog and the backup check.
 System folders (`.Trashes`, `.Spotlight-V100`, `.fseventsd`, `.rclone`, etc.)
-and Finder's `.DS_Store` files in any folder are always excluded. New backup and scratch sentinels have no exclusions;
+are always excluded at the root, and housekeeping names are skipped in any
+folder: `.DS_Store`, AppleDouble `._*` sidecars, `Thumbs.db`, `desktop.ini`,
+`.localized`, `.apdisk`, and nested copies of the system folders. New backup and scratch sentinels have no exclusions;
 legacy values are ignored. `sync --exclude` is no longer supported.
 
 ## The index

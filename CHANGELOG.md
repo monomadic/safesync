@@ -16,8 +16,10 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 - The review list rebuilt a row for every planned file on each keypress, so
   scrolling a plan with tens of thousands of files lagged behind the arrow
   keys. Only the rows on screen are built now.
-- Finder's `.DS_Store` files were indexed and copied like media. Scans now
-  skip them in every folder, and the index header records the rule.
+- Finder's `.DS_Store` files, AppleDouble `._*` sidecars, `Thumbs.db`,
+  `desktop.ini` and nested system folders (`.Spotlight-V100`, `.fseventsd`,
+  `.Trashes`, …) were indexed and copied like media. Scans now skip them in
+  every folder, and the index header records the rule.
 - A scan on a large drive appeared to hang after the walk: a silent second
   pass reopened every file to check nothing had changed, showing no progress,
   and Esc could not stop it because scans ignored the cancel flag. The

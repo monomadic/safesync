@@ -88,6 +88,32 @@ fn ds_store_files_are_left_out_of_the_index() {
     assert!(manifest.header.exclusions.iter().any(|e| e.contains(".DS_Store")));
 }
 #[test]
+fn housekeeping_files_are_left_out_of_the_index() {
+    let f = Fixture::new();
+    fs::write(f.root().join(".DS_Store"), b"finder").unwrap();
+    fs::create_dir(f.root().join("clips")).unwrap();
+    fs::write(f.root().join("clips/.DS_Store"), b"finder").unwrap();
+    fs::write(f.root().join("clips/._take.mov"), b"appledouble").unwrap();
+    fs::write(f.root().join("clips/Thumbs.db"), b"windows").unwrap();
+    fs::write(f.root().join("clips/take.mov"), b"video").unwrap();
+    fs::create_dir_all(f.root().join("clips/.Spotlight-V100/Store-V2")).unwrap();
+    fs::write(f.root().join("clips/.Spotlight-V100/Store-V2/index"), b"x").unwrap();
+    fs::create_dir(f.root().join("clips/_drafts")).unwrap();
+    fs::write(f.root().join("clips/_drafts/.take.mov"), b"kept").unwrap();
+    let manifest = f.scan(false);
+    let mut paths: Vec<_> = manifest.entries.iter().map(|e| e.path().unwrap()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            PathBuf::from("clips/_drafts/.take.mov"),
+            PathBuf::from("clips/take.mov")
+        ]
+    );
+    let exclusions = &manifest.header.exclusions;
+    assert!(exclusions.iter().any(|e| e.contains(".DS_Store")), "{exclusions:?}");
+}
+#[test]
 fn filename_query_does_not_claim_content_match() {
     let f = Fixture::new();
     fs::write(f.root().join("Film.mov"), b"anything").unwrap();
