@@ -23,6 +23,10 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
   `desktop.ini` and nested system folders (`.Spotlight-V100`, `.fseventsd`,
   `.Trashes`, …) were indexed and copied like media. Scans now skip them in
   every folder, and the index header records the rule.
+- The copy ETA was paced by the last few files, so a run of tiny files made
+  it swing wildly. It is now paced by the whole run, using whichever of the
+  byte rate and file rate says longer, and the speed averages over ten
+  seconds instead of a fraction of one.
 - A scan on a large drive appeared to hang after the walk: a silent second
   pass reopened every file to check nothing had changed, showing no progress,
   and Esc could not stop it because scans ignored the cancel flag. The

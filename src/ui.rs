@@ -70,22 +70,26 @@ pub(crate) fn bar(width: usize, ratio: f64, stops: &[(u8, u8, u8)]) -> Vec<Span<
     spans
 }
 
-/// Smoothed bytes/second from cumulative samples.
+/// Smoothed bytes/second from cumulative samples: a time-weighted average
+/// over roughly the last ten seconds, so a burst of tiny files or one
+/// stalled read moves the number without owning it.
 #[derive(Default)]
 struct Speed {
     ewma: f64,
     last: Option<(Instant, u64)>,
 }
 impl Speed {
+    const WINDOW_SECONDS: f64 = 10.0;
     fn sample(&mut self, now: Instant, total: u64) -> f64 {
         if let Some((then, bytes)) = self.last {
             let dt = now.duration_since(then).as_secs_f64();
             if dt > 0.05 {
                 let inst = total.saturating_sub(bytes) as f64 / dt;
+                let alpha = 1.0 - (-dt / Self::WINDOW_SECONDS).exp();
                 self.ewma = if self.ewma == 0.0 {
                     inst
                 } else {
-                    0.3 * inst + 0.7 * self.ewma
+                    alpha * inst + (1.0 - alpha) * self.ewma
                 };
                 self.last = Some((now, total));
             }
@@ -136,6 +140,9 @@ pub(crate) struct Model {
     total_bytes: u64,
     total_items: usize,
     total_speed: Speed,
+    /// When copying began; the ETA is paced by the whole run, not the
+    /// last few files.
+    transfer_started: Option<Instant>,
     log: VecDeque<(bool, String)>,
     pub(crate) summary: Option<Summary>,
     pub(crate) error: Option<String>,
@@ -161,6 +168,7 @@ impl Model {
             total_bytes: 0,
             total_items: 0,
             total_speed: Speed::default(),
+            transfer_started: None,
             log: VecDeque::new(),
             summary: None,
             error: None,
@@ -187,7 +195,12 @@ impl Model {
                 self.destination = destination;
                 self.destination_path = Some(destination_path);
             }
-            Event::Phase(phase) => self.phase = phase,
+            Event::Phase(phase) => {
+                self.phase = phase;
+                if phase == Phase::Transfer {
+                    self.transfer_started.get_or_insert(Instant::now());
+                }
+            }
             Event::Scan {
                 drive,
                 files,
@@ -271,6 +284,9 @@ impl Model {
                         } else if error.is_none() && w.bytes < w.size {
                             self.bytes += w.size - w.bytes;
                         }
+                        // Small files finish without a progress event, so
+                        // the speed would otherwise never see their bytes.
+                        self.total_speed.sample(Instant::now(), self.bytes);
                         let label = match kind {
                             Kind::Copy => "copied",
                             Kind::Replace => "replaced",
@@ -311,12 +327,35 @@ impl Model {
             self.disk = crate::copy::space(path).ok();
         }
     }
-    fn eta(&self, speed: f64) -> String {
-        if speed <= 0.0 || self.total_bytes <= self.bytes {
+    /// Time left, paced by the whole run so far rather than the last few
+    /// files: a stretch of tiny files makes the momentary byte rate
+    /// collapse while the remaining bytes sit in large files, and the
+    /// reverse hides the per-file cost of a long tail of small ones. Each
+    /// of bytes and files gives an estimate at its average rate since
+    /// copying began; the longer one is the honest answer.
+    fn eta(&self) -> String {
+        let Some(started) = self.transfer_started else {
+            return "—".into();
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        let finished = self.done + self.failed;
+        if elapsed < 5.0 || (self.bytes == 0 && finished == 0) {
             return "—".into();
         }
-        let secs = (self.total_bytes - self.bytes) as f64 / speed;
-        duration(secs)
+        let by_bytes = (self.bytes > 0).then(|| {
+            self.total_bytes.saturating_sub(self.bytes) as f64 * elapsed / self.bytes as f64
+        });
+        let by_files = (finished > 0)
+            .then(|| self.total_items.saturating_sub(finished) as f64 * elapsed / finished as f64);
+        let secs = [by_bytes, by_files]
+            .into_iter()
+            .flatten()
+            .fold(f64::NAN, f64::max);
+        if secs.is_nan() {
+            "—".into()
+        } else {
+            duration(secs)
+        }
     }
 }
 
@@ -640,10 +679,7 @@ fn draw_transfer(frame: &mut Frame, area: Rect, model: &Model, width: usize) {
             Style::default().fg(LABEL),
         ),
         Span::styled(format!("  {}", rate(speed)), Style::default().fg(SPEED)),
-        Span::styled(
-            format!("  eta {}", model.eta(speed)),
-            Style::default().fg(LABEL),
-        ),
+        Span::styled(format!("  eta {}", model.eta()), Style::default().fg(LABEL)),
         Span::styled(
             format!("  {}/{} done", model.done, model.total_items),
             Style::default().fg(DIM),
