@@ -173,7 +173,11 @@ never uses a saved index or a fingerprint cache:
 - **replace** — same path, different content. The backup's version goes to
   `.safesync/history/GENERATION/` first, never deleted.
 - **remove** — only with `extras = "history"`: backup-only files move to history
-  (`Kind::Retire` in the code). Directories are never removed, even once empty.
+  (`Kind::Retire` in the code).
+- **prune** — a directory a rename or removal left holding nothing but
+  housekeeping files (`.DS_Store`, `._*` sidecars, `Thumbs.db`, …) is dropped,
+  along with any parents that are then empty. A directory with anything else
+  in it stays.
 
 The source is never written except for its own `.safesync/index`. Each file is
 copied uncached (`F_NOCACHE`), preallocated, read and written on separate

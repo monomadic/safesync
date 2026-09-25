@@ -6,6 +6,9 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ### Changed
 
+- Sync has a prune stage: after renames and removals, every directory they
+  emptied is dropped even when `.DS_Store` or `._*` sidecars were left in it.
+  Those files stopped the old empty-directory check, so folders lingered.
 - The review and copy screens show the plan's stages — rename, remove,
   replace, copy — with planned counts before confirmation and done/planned
   counts while running, the current stage highlighted. Backup-only files

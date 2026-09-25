@@ -311,6 +311,36 @@ impl Root {
         })
     }
 
+    /// Drops `relative` when nothing but housekeeping files (.DS_Store,
+    /// AppleDouble sidecars, Thumbs.db, …) are left in it, then any parents
+    /// that are empty. A directory holding anything else, or a nested
+    /// directory, stays. Returns whether the directory was removed.
+    pub fn prune(&self, relative: &Path) -> Result<bool> {
+        let Some(directory) = open_relative_optional(&self.directory, relative, self.device)?
+        else {
+            return Ok(false);
+        };
+        if !directory.metadata()?.is_dir() {
+            return Ok(false);
+        }
+        let leftovers = names(&directory)?;
+        for name in &leftovers {
+            if !crate::scan::housekeeping(name) {
+                return Ok(false);
+            }
+            let (mode, device) = child_mode(&directory, name)?;
+            if mode != libc::S_IFREG as u32 || device != self.device {
+                return Ok(false);
+            }
+        }
+        for name in &leftovers {
+            self.file(&relative.join(name), false)?.unlink(0)?;
+        }
+        self.file(relative, false)?.unlink(libc::AT_REMOVEDIR)?;
+        self.remove_empty_parents(relative);
+        Ok(true)
+    }
+
     pub fn remove_empty_parents(&self, relative: &Path) {
         let mut current = relative.parent();
         while let Some(path) = current.filter(|p| !p.as_os_str().is_empty()) {

@@ -936,6 +936,10 @@ fn source_owns_exclusions_and_backup_never_publishes_or_uses_a_saved_index() {
     write(&b.root, "protected/backup.mov", b"must stay");
     write(&b.root, ".rclone/cache", b"system data must stay");
     write(&b.root, "extra.mov", b"extra");
+    // A folder the removal empties, bar Finder's metadata, goes with it.
+    write(&b.root, "gone/deeper/old.mov", b"old");
+    write(&b.root, "gone/deeper/.DS_Store", b"finder");
+    write(&b.root, "gone/._old.mov", b"sidecar");
     // Even a corrupt historical backup index must not affect the check.
     let legacy = backup.metadata_dir().join("index-legacy.jsonl");
     fs::write(&legacy, b"historical index, untouched").unwrap();
@@ -949,7 +953,8 @@ fn source_owns_exclusions_and_backup_never_publishes_or_uses_a_saved_index() {
     let result = drive_work(move |c| engine::sync(options, c), true);
     assert_eq!(result.failure(), None);
     assert_eq!(result.summary().failed, 0, "{:?}", result.errors());
-    assert_eq!(result.summary().done, 2); // copy plus retire
+    // copy, two removals, and pruning gone/deeper then gone
+    assert_eq!(result.summary().done, 5);
     let index = source.index().unwrap();
     assert_eq!(index.entries.len(), 1);
     assert_eq!(
@@ -966,6 +971,19 @@ fn source_owns_exclusions_and_backup_never_publishes_or_uses_a_saved_index() {
     );
     assert!(b.root.join(".rclone/cache").exists());
     assert!(!b.root.join("extra.mov").exists());
+    assert!(
+        !b.root.join("gone").exists(),
+        "pruned with its housekeeping files"
+    );
+    assert!(
+        backup
+            .metadata_dir()
+            .join("history")
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|g| g.path().join("gone/deeper/old.mov").exists())
+    );
     assert_eq!(backup.generations(), vec![legacy.clone()]);
     assert_eq!(fs::read(&legacy).unwrap(), b"historical index, untouched");
     assert!(!result.events.iter().any(|e| matches!(

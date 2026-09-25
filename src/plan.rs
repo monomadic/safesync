@@ -25,13 +25,17 @@ pub enum Action {
     },
     /// On the backup only, and the sentinel says such files go to history.
     Retire { path: PathBuf, size: u64 },
+    /// A directory a removal or rename may have emptied: dropped once only
+    /// housekeeping files (.DS_Store, ._* sidecars) are left in it.
+    Prune { path: PathBuf },
 }
 impl Action {
     pub fn path(&self) -> &PathBuf {
         match self {
-            Self::Copy { path, .. } | Self::Replace { path, .. } | Self::Retire { path, .. } => {
-                path
-            }
+            Self::Copy { path, .. }
+            | Self::Replace { path, .. }
+            | Self::Retire { path, .. }
+            | Self::Prune { path } => path,
             Self::Rename { to, .. } => to,
         }
     }
@@ -250,12 +254,38 @@ pub fn plan(source: &Manifest, backup: &Manifest, extras: Extras) -> Result<Plan
             }),
         }
     }
-    // Renames and retirements first: they free names and space for the copies.
+    // Every directory a rename or removal leaves behind is a prune
+    // candidate, deepest first so a child goes before its parent.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for action in &plan.actions {
+        let left = match action {
+            Action::Rename { from, .. } => from,
+            Action::Retire { path, .. } => path,
+            _ => continue,
+        };
+        let mut parent = left.parent();
+        while let Some(dir) = parent.filter(|p| !p.as_os_str().is_empty()) {
+            candidates.push(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| a.cmp(b))
+    });
+    candidates.dedup();
+    plan.actions
+        .extend(candidates.into_iter().map(|path| Action::Prune { path }));
+    // Renames and removals first: they free names and space for the copies;
+    // pruning follows them, before anything is written.
     plan.actions.sort_by_key(|action| match action {
         Action::Rename { .. } => 0,
         Action::Retire { .. } => 1,
-        Action::Replace { .. } => 2,
-        Action::Copy { .. } => 3,
+        Action::Prune { .. } => 2,
+        Action::Replace { .. } => 3,
+        Action::Copy { .. } => 4,
     });
     Ok(plan)
 }

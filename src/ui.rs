@@ -140,7 +140,7 @@ pub(crate) struct Model {
     total_bytes: u64,
     total_items: usize,
     /// Planned and finished counts per action kind, in the order the
-    /// engine runs them: renames, removals, replacements, copies.
+    /// engine runs them: renames, removals, pruning, replacements, copies.
     stages: Vec<(Kind, usize, usize)>,
     total_speed: Speed,
     /// When copying began; the ETA is paced by the whole run, not the
@@ -245,17 +245,23 @@ impl Model {
                     .iter()
                     .filter(|i| i.kind != Kind::Skip)
                     .count();
-                self.stages = [Kind::Rename, Kind::Retire, Kind::Replace, Kind::Copy]
-                    .into_iter()
-                    .map(|kind| {
-                        (
-                            kind,
-                            overview.items.iter().filter(|i| i.kind == kind).count(),
-                            0,
-                        )
-                    })
-                    .filter(|(_, total, _)| *total > 0)
-                    .collect();
+                self.stages = [
+                    Kind::Rename,
+                    Kind::Retire,
+                    Kind::Prune,
+                    Kind::Replace,
+                    Kind::Copy,
+                ]
+                .into_iter()
+                .map(|kind| {
+                    (
+                        kind,
+                        overview.items.iter().filter(|i| i.kind == kind).count(),
+                        0,
+                    )
+                })
+                .filter(|(_, total, _)| *total > 0)
+                .collect();
                 self.list.select(if overview.items.is_empty() {
                     None
                 } else {
@@ -310,6 +316,7 @@ impl Model {
                             Kind::Replace => "replaced",
                             Kind::Rename => "renamed",
                             Kind::Retire => "removed",
+                            Kind::Prune => "pruned",
                             Kind::Skip => "skipped",
                         };
                         match error {
@@ -404,6 +411,7 @@ fn stage_line(model: &Model) -> Line<'static> {
         let name = match kind {
             Kind::Rename => "rename",
             Kind::Retire => "remove",
+            Kind::Prune => "prune",
             Kind::Replace => "replace",
             Kind::Copy => "copy",
             Kind::Skip => "skip",
@@ -433,6 +441,7 @@ fn kind_span(kind: Kind) -> Span<'static> {
         Kind::Replace => ("replace", WARN),
         Kind::Rename => ("rename ", PCT),
         Kind::Retire => ("remove ", FREE),
+        Kind::Prune => ("prune  ", FREE),
         Kind::Skip => ("skip   ", DIM),
     };
     Span::styled(text, Style::default().fg(color))

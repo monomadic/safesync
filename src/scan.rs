@@ -145,7 +145,7 @@ const SYSTEM_NAMES: &[&str] = &[
 /// the system names above, and AppleDouble sidecars (`._name`, the resource
 /// fork and Finder info macOS writes beside a file on filesystems without
 /// native forks).
-fn housekeeping(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn housekeeping(name: &std::ffi::OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let bytes = name.as_bytes();
     name == ".safesync"

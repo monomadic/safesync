@@ -36,6 +36,7 @@ pub enum Kind {
     Replace,
     Rename,
     Retire,
+    Prune,
     Skip,
 }
 
@@ -386,6 +387,7 @@ fn run_sync(options: SyncOptions, control: &Control) -> Result<()> {
                     Action::Replace { .. } => Kind::Replace,
                     Action::Rename { .. } => Kind::Rename,
                     Action::Retire { .. } => Kind::Retire,
+                    Action::Prune { .. } => Kind::Prune,
                 },
                 path: match action {
                     Action::Rename { from, to, .. } => {
@@ -467,6 +469,7 @@ fn run_actions(
             Action::Replace { .. } => Kind::Replace,
             Action::Rename { .. } => Kind::Rename,
             Action::Retire { .. } => Kind::Retire,
+            Action::Prune { .. } => Kind::Prune,
         };
         control.send(Event::Start {
             worker: 0,
@@ -649,6 +652,9 @@ fn apply(
                 .rename_to(&backup.file(&history.join(path), true)?)?;
             backup.remove_empty_parents(path);
             backup_index.entries.remove(path);
+        }
+        Action::Prune { path } => {
+            backup.prune(path)?;
         }
         Action::Copy { path, .. } | Action::Replace { path, .. } => {
             let target = backup.file(path, true)?;
