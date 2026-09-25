@@ -543,17 +543,22 @@ impl Screen {
             && matches!(self.mode, Mode::Table)
         {
             if work.phase() == Phase::Done {
+                // A finished panel is dismissed by any key; Enter, Space and
+                // Esc only dismiss it, while a command key like `y` also
+                // goes on to run as if the panel were already gone.
+                self.finish_work();
                 if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) || quit {
-                    self.finish_work();
                     return None;
                 }
-            } else if work.key(code, quit) {
-                return None;
-            }
-            if matches!(code, KeyCode::Char('y' | 's' | 'S' | 'r' | '/' | 'R')) {
-                let verb = work.model.verb;
-                self.say(false, format!("Wait for the {verb} to finish (Esc stops it)."));
-                return None;
+            } else {
+                if work.key(code, quit) {
+                    return None;
+                }
+                if matches!(code, KeyCode::Char('y' | 's' | 'S' | 'r' | '/' | 'R')) {
+                    let verb = work.model.verb;
+                    self.say(false, format!("Wait for the {verb} to finish (Esc stops it)."));
+                    return None;
+                }
             }
         }
         match &mut self.mode {

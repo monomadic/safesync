@@ -16,6 +16,9 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ### Fixed
 
+- After a scan or sync finished in the drives panel, pressing `y` (or `s`,
+  `r`, `/`) said "Wait for the scan to finish" instead of acting. Any key
+  now dismisses the finished panel, and a command key goes on to run.
 - The review list rebuilt a row for every planned file on each keypress, so
   scrolling a plan with tens of thousands of files lagged behind the arrow
   keys. Only the rows on screen are built now.
