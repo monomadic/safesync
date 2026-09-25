@@ -169,17 +169,24 @@ pub fn resolve(
         .collect()
 }
 
-pub fn write(selections: &[Selection], output: impl Write) -> Result<()> {
+/// Every full path in the selected catalogs, each followed by a newline, or
+/// by NUL when `nul` is set (names can contain newlines; NUL is unambiguous).
+pub fn write(selections: &[Selection], output: impl Write, nul: bool) -> Result<()> {
+    let terminator = if nul { 0 } else { b'\n' };
     let mut output = BufWriter::with_capacity(64 * 1024, output);
     for selection in selections {
         let file = File::open(&selection.catalog.path)?;
         if manifest::binary_file(&file)? {
-            binary::Index::from_file(file)?.write_paths(&selection.root, &mut output)?;
+            binary::Index::from_file(file)?.write_paths(
+                &selection.root,
+                &mut output,
+                terminator,
+            )?;
         } else {
             let m = Manifest::load(&selection.catalog.path)?;
             for entry in &m.entries {
                 output.write_all(selection.root.join(entry.path()?).as_os_str().as_bytes())?;
-                output.write_all(&[0])?;
+                output.write_all(&[terminator])?;
             }
         }
     }
@@ -307,7 +314,7 @@ pub fn search(source_uuid: Option<&str>) -> Result<Option<SearchHit>> {
         .context("Cannot start fzf; install fzf to search source paths")?;
     let input = child.stdin.take().context("fzf input unavailable")?;
     let output = std::thread::scope(|scope| -> Result<_> {
-        let feed = scope.spawn(|| write(&selections, input));
+        let feed = scope.spawn(|| write(&selections, input, true));
         let output = child.wait_with_output()?;
         let result = feed
             .join()

@@ -90,8 +90,13 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
-    /// Stream full source paths, each followed by NUL (for fzf --read0 or xargs -0).
-    Paths { indexes: Vec<PathBuf> },
+    /// Stream full source paths, one per line.
+    Paths {
+        indexes: Vec<PathBuf>,
+        /// End each path with NUL instead of a newline (for fzf --read0 or xargs -0).
+        #[arg(long)]
+        print0: bool,
+    },
     /// Convert selected source catalogs to binary without rescanning or deleting JSONL.
     Migrate { indexes: Vec<PathBuf> },
     /// Search saved indexes while the drives are unplugged.
@@ -275,9 +280,9 @@ fn run(cli: Cli) -> Result<i32> {
             };
             return ui::run("fill", yes, move |control| engine::fill(options, control));
         }
-        Command::Paths { indexes } => {
+        Command::Paths { indexes, print0 } => {
             let selected = safesync::paths::select(&indexes)?;
-            let result = safesync::paths::write(&selected, std::io::stdout().lock());
+            let result = safesync::paths::write(&selected, std::io::stdout().lock(), print0);
             if result.as_ref().err().is_some_and(|e| {
                 e.chain().any(|c| {
                     c.downcast_ref::<std::io::Error>()

@@ -99,7 +99,7 @@ fn binary_roundtrip_sorted_paths_fingerprints_and_raw_export() {
     assert!(index.find_path(b"absent").unwrap().is_none());
     let mut out = Vec::new();
     index
-        .write_paths(Path::new("/new mount"), &mut out)
+        .write_paths(Path::new("/new mount"), &mut out, 0)
         .unwrap();
     let mut expected_out = Vec::new();
     for entry in &expected {
@@ -256,8 +256,11 @@ fn path_selection_deduplicates_generations_and_resolves_mounts_by_uuid() {
     mounts.insert("binary-source".into(), PathBuf::from("/Volumes/Source 2"));
     let online = paths::resolve(catalogs, &mounts).unwrap();
     let mut out = Vec::new();
-    paths::write(&online, &mut out).unwrap();
+    paths::write(&online, &mut out, true).unwrap();
     assert_eq!(out, b"/Volumes/Source 2/clip\0");
+    let mut out = Vec::new();
+    paths::write(&online, &mut out, false).unwrap();
+    assert_eq!(out, b"/Volumes/Source 2/clip\n");
     // Same-name sources remain distinct by UUID.
     let mut other = current;
     other.header.volume.uuid = "other-source".into();
@@ -300,7 +303,7 @@ fn cli_exports_and_searches_only_newest_sources_and_converts_legacy_files() {
             .output()
             .unwrap()
     };
-    let output = cli(&["paths".as_ref()]);
+    let output = cli(&["paths".as_ref(), "--print0".as_ref()]);
     assert!(output.status.success(), "{:?}", output);
     use std::os::unix::ffi::OsStrExt;
     let mut expected = f
@@ -310,6 +313,10 @@ fn cli_exports_and_searches_only_newest_sources_and_converts_legacy_files() {
         .as_bytes()
         .to_vec();
     expected.push(0);
+    assert_eq!(output.stdout, expected);
+    let output = cli(&["paths".as_ref()]);
+    assert!(output.status.success(), "{:?}", output);
+    *expected.last_mut().unwrap() = b'\n';
     assert_eq!(output.stdout, expected);
     let output = cli(&[
         "lookup".as_ref(),

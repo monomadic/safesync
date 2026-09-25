@@ -223,15 +223,18 @@ right now. Exit 0 match, 1 no match, 3 same-size candidates without fingerprints
 ## Path export and conversion
 
 ```sh
-safesync paths Tower | fzf --read0 --exact
-safesync paths | xargs -0 your-command
+safesync paths Tower | switchblade
+safesync paths --print0 Tower | fzf --read0 --exact
+safesync paths --print0 | xargs -0 your-command
 safesync migrate /Volumes/Tower
 safesync migrate saved-source.jsonl
 ```
 
-`paths [DRIVE|INDEX ...]` writes only full paths followed by NUL. With no arguments
-it selects the newest saved source catalog per UUID. It preserves raw bytes,
-including tabs, newlines and non-UTF-8 names, through a bounded output buffer.
+`paths [DRIVE|INDEX ...]` writes only full paths, one per line, or each
+followed by NUL with `--print0`. With no arguments it selects the newest saved
+source catalog per UUID. It preserves raw bytes, including tabs and non-UTF-8
+names, through a bounded output buffer; a name containing a newline is only
+unambiguous with `--print0`.
 Mounted source roots are matched by UUID; offline paths use the recorded root
 and do not establish current existence or ownership. Use UUIDs or index filenames
 when source names are ambiguous.

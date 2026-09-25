@@ -6,6 +6,9 @@ Notable changes to safesync. Dates are the day the change landed on `main`.
 
 ### Changed
 
+- `paths` now writes one path per line by default, so it pipes straight into
+  line-oriented tools; `--print0` restores NUL terminators for `fzf --read0`
+  and `xargs -0`. The drives screen's `/` search still feeds fzf with NUL.
 - Scans and syncs started from the drives screen now run in a panel under
   the drive table instead of switching to a separate full-screen view. The
   table stays visible, the preview and confirmation happen in the panel, and

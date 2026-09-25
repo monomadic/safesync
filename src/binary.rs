@@ -471,7 +471,7 @@ impl Index {
             entries,
         })
     }
-    pub fn write_paths(&self, root: &Path, mut output: impl Write) -> Result<()> {
+    pub fn write_paths(&self, root: &Path, mut output: impl Write, terminator: u8) -> Result<()> {
         ensure!(
             root.is_absolute() && !root.as_os_str().as_bytes().contains(&0),
             "Invalid export root"
@@ -483,7 +483,7 @@ impl Index {
                 output.write_all(b"/")?;
             }
             output.write_all(record.path)?;
-            output.write_all(&[0])?;
+            output.write_all(&[terminator])?;
         }
         Ok(())
     }
