@@ -415,7 +415,7 @@ impl Screen {
                 [backup] => *backup,
                 _ => {
                     return Err(
-                        "Select a backup in this group, then press y to check / sync.".into(),
+                        "Select a backup in this group, then press s to sync.".into(),
                     );
                 }
             }
@@ -436,7 +436,7 @@ impl Screen {
     fn sync_hint(&self) -> String {
         match self.sync_pair() {
             Ok((source, backup)) => format!(
-                "y Check / sync: {} → {} · review before copying",
+                "s sync: {} → {} · review before copying",
                 source.name, backup.name
             ),
             Err(why) => why,
@@ -521,8 +521,8 @@ impl Screen {
                         drive.sentinel.name,
                         ROLES[role_index(role)].1.trim(),
                         match role {
-                            Role::Source => "Next: s to index, or y to check / sync.",
-                            Role::Backup => "Next: y to check / sync.",
+                            Role::Source => "Next: i to index, or s to sync.",
+                            Role::Backup => "Next: s to sync.",
                             Role::Scratch => "Ready for fill.",
                         }
                     ),
@@ -554,7 +554,7 @@ impl Screen {
                 if work.key(code, quit) {
                     return None;
                 }
-                if matches!(code, KeyCode::Char('y' | 's' | 'S' | 'r' | '/' | 'R')) {
+                if matches!(code, KeyCode::Char('s' | 'i' | 'I' | 'r' | '/' | 'R')) {
                     let verb = work.model.verb;
                     self.say(false, format!("Wait for the {verb} to finish (Esc stops it)."));
                     return None;
@@ -578,7 +578,7 @@ impl Screen {
                     self.mode = Mode::Details { scroll: 0 }
                 }
                 KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
-                KeyCode::Char('y') => match self.sync_pair() {
+                KeyCode::Char('s') => match self.sync_pair() {
                     Ok((source, backup)) => {
                         return Some(Action::Sync {
                             source: source.path.clone().unwrap(),
@@ -603,13 +603,13 @@ impl Screen {
                         }
                     }
                 }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
+                KeyCode::Char('i') | KeyCode::Char('I') => {
                     if let Some(row) = self.row() {
                         match (row.scan_refusal(), &row.path) {
                             (None, Some(path)) => {
                                 return Some(Action::Scan {
                                     root: path.clone(),
-                                    hash: code == KeyCode::Char('S'),
+                                    hash: code == KeyCode::Char('I'),
                                 });
                             }
                             (why, _) => {
@@ -836,28 +836,10 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
         .iter()
         .filter(|s| s.key.starts_with("source:"))
         .count();
-    let unassigned = screen
-        .inventory
-        .rows
-        .iter()
-        .filter(|r| matches!(r.marking, Marking::Unmarked))
-        .count();
     let offline = screen.inventory.rows.iter().filter(|r| !r.online()).count();
-    let mut summary = format!(
-        "  {groups} sync group{} · {unassigned} unassigned",
-        if groups == 1 { "" } else { "s" }
-    );
+    let mut summary = format!("groups: {groups}");
     if offline > 0 {
-        summary.push_str(&format!(" · {offline} offline"));
-    }
-    if screen.reading() {
-        summary.push_str(" · reading indexes…");
-    }
-    if !screen.inventory.warnings.is_empty() {
-        summary.push_str(&format!(
-            " · {} warnings (? to read)",
-            screen.inventory.warnings.len()
-        ));
+        summary.push_str(" (offline)");
     }
     let badge = if screen.icons {
         format!(" {APP_ICON}  safesync ")
@@ -869,9 +851,14 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
     } else {
         ""
     };
-    let gap = (area.width as usize).saturating_sub(Line::from(badge.as_str()).width() + help.len());
+    let gap = (area.width as usize)
+        .saturating_sub(Line::from(badge.as_str()).width())
+        .saturating_sub(summary.len() + 2)
+        .saturating_sub(help.len());
     let spans = vec![
         Span::styled(badge, Style::default().bg(FREE).fg(BADGE_FG).bold()),
+        Span::raw("  "),
+        Span::styled(summary, Style::default().fg(LABEL)),
         Span::raw(" ".repeat(gap)),
         Span::styled(help, Style::default().fg(FREE).bold()),
     ];
@@ -882,16 +869,6 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
             ..area
         },
     );
-    if area.height > 1 {
-        frame.render_widget(
-            Paragraph::new(label(&summary)),
-            Rect {
-                y: area.y + 1,
-                height: area.height - 1,
-                ..area
-            },
-        );
-    }
 }
 
 fn selection_style(selected: bool) -> Style {
@@ -952,13 +929,13 @@ fn backup_status(row: &Row, reading: bool) -> Option<(String, Color)> {
             if *n == 0 { LABEL } else { WARN },
         ),
         None if source_name.is_none() => ("Source unknown · comparison unavailable".into(), WARN),
-        None => ("No saved comparison · y Check / sync".into(), LABEL),
+        None => ("No saved comparison · s sync".into(), LABEL),
     })
 }
 
 fn index_status(screen: &Screen, row: &Row) -> String {
     if row.role() == Some(Role::Backup) {
-        return "Check with y".into();
+        return "Check with s".into();
     }
     if row.role() == Some(Role::Scratch) {
         return "—".into();
@@ -969,7 +946,7 @@ fn index_status(screen: &Screen, row: &Row) -> String {
             "Indexed {}",
             ago(index.finished_unix, screen.inventory.loaded_unix)
         ),
-        None if row.role() == Some(Role::Backup) => "Check with y".into(),
+        None if row.role() == Some(Role::Backup) => "Check with s".into(),
         None if row.role() == Some(Role::Scratch) => "—".into(),
         None if row.role().is_some() => "Not indexed".into(),
         None => "—".into(),
@@ -1005,23 +982,6 @@ fn draw_table(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     let name_width = width
         .saturating_sub(reserved)
         .clamp(4, preferred_name_width);
-    let mut heading = format!("    {}", pad("DRIVE", name_width));
-    if role {
-        heading.push_str("  ROLE     ");
-    }
-    if age {
-        heading.push_str(&format!("  {}", pad("INDEX STATUS", 18)));
-    }
-    if capacity {
-        heading.push_str(&right("FREE / CAPACITY", 23));
-    }
-    frame.render_widget(
-        Paragraph::new(label(&heading)),
-        Rect {
-            height: table.height.min(1),
-            ..table
-        },
-    );
 
     let mut lines = Vec::new();
     let mut selected_line = 0;
@@ -1135,7 +1095,7 @@ fn draw_table(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     if lines.is_empty() {
         lines.push(Line::from(label("  No volumes found.")));
     }
-    let height = table.height.saturating_sub(1) as usize;
+    let height = table.height as usize;
     // Leave a line below the selected drive for its comparison status.
     let first = selected_line
         .saturating_sub(height.saturating_sub(2))
@@ -1148,14 +1108,7 @@ fn draw_table(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
     {
         visible[0] = title;
     }
-    frame.render_widget(
-        Paragraph::new(visible),
-        Rect {
-            y: table.y.saturating_add(1),
-            height: table.height.saturating_sub(1),
-            ..table
-        },
-    );
+    frame.render_widget(Paragraph::new(visible), table);
     if detail_height > 0 {
         draw_summary(frame, parts[1], screen);
     }
@@ -1209,7 +1162,7 @@ fn summary_lines(screen: &Screen, row: &Row) -> Vec<Line<'static>> {
     if let Some((status, color)) = backup_status(row, screen.reading()) {
         lines.push(Line::from(value(status, color)));
         lines.push(Line::from(label(
-            "Press y to check the mounted backup before syncing.",
+            "Press s to check the mounted backup before syncing.",
         )));
     } else {
         let message = match &row.marking {
@@ -1366,15 +1319,15 @@ fn help_lines(screen: &Screen) -> Vec<Line<'static>> {
         Line::from(label("←→ / h l   Collapse / expand a section")),
         Line::from(label("Enter      Toggle a section or open drive details")),
         Line::from(label(
-            "y          Check / sync the selected backup or sync group",
+            "s          Sync the selected backup or sync group",
         )),
         Line::from(label(
             "           Checks both drives, then asks before copying; no manual indexing needed",
         )),
         Line::from(label(
-            "s          Index a source and reuse known fingerprints",
+            "i          Index a source and reuse known fingerprints",
         )),
-        Line::from(label("S          Index a source and fingerprint new files")),
+        Line::from(label("I          Index a source and fingerprint new files")),
         Line::from(label("r          Assign a role to an unassigned drive")),
         Line::from(label(
             "d          Index details; ↑↓ / PgUp / PgDn to scroll",
@@ -1537,13 +1490,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
         Mode::Table => {
             let action = match screen.row() {
                 Some(row) if row.assign_refusal().is_none() => "r Assign role · d Details",
-                Some(row) if row.role() == Some(Role::Backup) => "y Check / sync · d Details",
+                Some(row) if row.role() == Some(Role::Backup) => "s sync · d Details",
                 Some(row) if row.role() == Some(Role::Source) => {
-                    "y Check / sync · s Scan · d Details"
+                    "s sync · i Index · d Details"
                 }
-                Some(row) if row.scan_refusal().is_none() => "s Scan · S Fingerprint · d Details",
+                Some(row) if row.scan_refusal().is_none() => "i Index · I Fingerprint · d Details",
                 Some(_) => "d Details",
-                None if screen.sync_context() => "y Check / sync · Enter Expand/collapse",
+                None if screen.sync_context() => "s sync · Enter Expand/collapse",
                 None => "Enter Expand/collapse",
             };
             format!("{action}   / Search   ? Help   q Quit")
@@ -1574,7 +1527,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
         }
         .to_owned()
     } else if matches!(screen.mode, Mode::Table) && screen.sync_context() && width < 76 {
-        "y Check/sync  ? Help  q Quit".to_owned()
+        "s sync  ? Help  q Quit".to_owned()
     } else if matches!(screen.mode, Mode::Table) && width < 40 {
         "? Help  q Quit".to_owned()
     } else if matches!(screen.mode, Mode::Table) && width < 76 {
@@ -1590,13 +1543,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
         },
     );
     if area.height > 1 {
-        let spans: Vec<_> = keys
+        let mut spans: Vec<_> = keys
             .split_inclusive(' ')
             .map(|part| {
                 let shortcut = matches!(
                     part.trim(),
                     "s" | "S"
-                        | "y"
+                        | "i"
+                        | "I"
                         | "d"
                         | "r"
                         | "R"
@@ -1619,6 +1573,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen, width: usize) {
                 )
             })
             .collect();
+        spans.insert(0, Span::raw(" "));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(BAR_BG)),
             Rect {
@@ -1833,7 +1788,6 @@ mod tests {
         screen.pending = Some(receiver);
         let (text, _) = render(&mut screen, 100, 30);
         assert!(text.contains("Loading comparison…"), "{text}");
-        assert!(text.contains("INDEX STATUS"), "{text}");
         assert!(!text.contains("Index missing"), "{text}");
         assert!(!text.contains("No saved comparison"), "{text}");
         sender
@@ -1874,12 +1828,12 @@ mod tests {
             Focus::Section("source:source".into()),
         ] {
             screen.selected = focus;
-            assert!(matches!(screen.key(KeyCode::Char('y'), KeyModifiers::NONE),
+            assert!(matches!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE),
                 Some(Action::Sync { source, backup })
                 if source == PathBuf::from("/Volumes/DemoTower") && backup == PathBuf::from("/Volumes/DemoBackup")));
             for (width, height) in [(100, 30), (60, 18), (40, 12)] {
                 let (text, _) = render(&mut screen, width, height);
-                assert!(text.contains("y Check"), "{width}x{height}\n{text}");
+                assert!(text.contains("s sync"), "{width}x{height}\n{text}");
             }
         }
     }
@@ -1895,7 +1849,7 @@ mod tests {
         ));
         let mut screen = Screen::from_inventory(inv);
         screen.focus_row(2);
-        assert!(screen.key(KeyCode::Char('y'), KeyModifiers::NONE).is_none());
+        assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
         assert!(
             screen
                 .status
@@ -1905,7 +1859,7 @@ mod tests {
                 .contains("Select a backup")
         );
         screen.focus_row(5);
-        assert!(matches!(screen.key(KeyCode::Char('y'), KeyModifiers::NONE),
+        assert!(matches!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE),
             Some(Action::Sync { backup, .. }) if backup.ends_with("Second")));
     }
 
@@ -1921,7 +1875,7 @@ mod tests {
                 }
                 let mut screen = Screen::from_inventory(inv);
                 screen.focus_row(1);
-                assert!(screen.key(KeyCode::Char('y'), KeyModifiers::NONE).is_none());
+                assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
                 assert!(screen.status.is_some());
             }
         }
@@ -2079,11 +2033,11 @@ mod tests {
         assert_eq!(screen.selected, Focus::Drive(2));
         key(&mut screen, KeyCode::Down);
         assert_eq!(screen.selected, Focus::Drive(1));
-        assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
+        assert!(screen.key(KeyCode::Char('i'), KeyModifiers::NONE).is_none());
         assert!(screen.status.as_ref().unwrap().1.contains("only sources"));
         key(&mut screen, KeyCode::Left);
         assert_eq!(screen.selected, Focus::Section("source:source".into()));
-        assert!(screen.key(KeyCode::Char('s'), KeyModifiers::NONE).is_none());
+        assert!(screen.key(KeyCode::Char('i'), KeyModifiers::NONE).is_none());
         key(&mut screen, KeyCode::Down);
         assert_eq!(screen.selected, Focus::Section("unassigned".into()));
         key(&mut screen, KeyCode::Up);

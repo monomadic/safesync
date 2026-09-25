@@ -41,7 +41,7 @@ relationship, index coverage and location. From the table:
   its section. Enter toggles a section or opens a drive's index details.
 - `d` opens scrollable index details (UUID, generations, scan exclusions and
   fingerprints reused); `?` opens help and inventory warnings. Esc returns.
-- `y` **Check / sync** checks the selected backup against its linked source,
+- `s` **sync** checks the selected backup against its linked source,
   previews the changes, and asks for confirmation before copying. No manual
   indexing is required first. It also works from the source or group heading
   when there is one linked backup; with several, select the intended backup.
@@ -51,7 +51,7 @@ relationship, index coverage and location. From the table:
 - `r` assigns a role to an unmarked disk (a backup then picks the mounted
   source it mirrors). Roles are never *changed* from here; that stays a
   deliberate edit of `drive.toml`.
-- `s` indexes the selected source (`S` also fingerprints files that have none)
+- `i` indexes the selected source (`I` also fingerprints files that have none)
   in the same panel; Esc stops a scan between directories or files without
   writing anything. The table stays visible and navigable meanwhile.
 - `/` hands source paths to `fzf --read0 --print0 --exact` after restoring the
@@ -60,7 +60,7 @@ relationship, index coverage and location. From the table:
   only after checking that the same source UUID is mounted. Requires `fzf`.
 - `R` reloads volumes and indexes, keeping the selected drive by UUID.
 
-The table reads index summaries only. Backups show **Check with y**; saved
+The table reads index summaries only. Backups show **Check with s**; saved
 inventories are never compared as evidence of a current backup. Persistent
 check timestamps and offline records for backups without old indexes remain
 planned. Use explicit `compare` for historical catalog comparisons.
